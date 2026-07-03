@@ -1,9 +1,10 @@
 {
   "name": "anime-pixelize-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "pixelize-server.js",
   "scripts": {
-    "start": "node pixelize-server.js"
+    "start": "node pixelize-server.js",
+    "dev": "node --watch pixelize-server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
