@@ -35,7 +35,12 @@ catch (e) { console.warn("[cache] better-sqlite3 unavailable; disk cache disable
 
 // ---------- CONFIG (env-driven so you can retune without editing code) ----------
 const PORT                    = Number(process.env.PORT || 3000);
-const MAX_CACHE_ITEMS         = Number(process.env.MAX_CACHE_ITEMS || 200);
+// Legacy MAX_CACHE_ITEMS is retained only as a preview-cache fallback.
+const LEGACY_MAX_CACHE_ITEMS  = Number(process.env.MAX_CACHE_ITEMS || 0);
+const MAX_PREVIEW_CACHE_ITEMS = Number(process.env.MAX_PREVIEW_CACHE_ITEMS || LEGACY_MAX_CACHE_ITEMS || 120);
+const MAX_CANVAS_CACHE_ITEMS  = Number(process.env.MAX_CANVAS_CACHE_ITEMS || 20);
+const MAX_LARGE_CANVAS_CACHE_ITEMS = Number(process.env.MAX_LARGE_CANVAS_CACHE_ITEMS || 2);
+const LARGE_CANVAS_MIN_PIXELS = Number(process.env.LARGE_CANVAS_MIN_PIXELS || 200_000);
 const MAX_CONCURRENT_PIXELIZE = Number(process.env.MAX_CONCURRENT_PIXELIZE || 1);
 const MAX_QUEUE_SIZE          = Number(process.env.MAX_QUEUE_SIZE || 30);
 const RATE_LIMIT_PER_MIN      = Number(process.env.RATE_LIMIT_PER_MIN || 120);
@@ -147,7 +152,21 @@ class LRU {
   invalidate(key) { this.map.delete(key); }
   size() { return this.map.size; }
 }
-const memCache = new LRU(MAX_CACHE_ITEMS, TTL_PREVIEW_MS);   // per-entry TTL set on write
+const previewMemCache = new LRU(MAX_PREVIEW_CACHE_ITEMS, TTL_PREVIEW_MS);
+const canvasMemCache = new LRU(MAX_CANVAS_CACHE_ITEMS, TTL_CANVAS_MS);
+const largeCanvasMemCache = new LRU(MAX_LARGE_CANVAS_CACHE_ITEMS, TTL_CANVAS_MS);
+
+function chooseMemoryCache(isCanvas, w, h) {
+  if (!isCanvas) return { cache: previewMemCache, kind: "preview" };
+  if (w * h >= LARGE_CANVAS_MIN_PIXELS) {
+    return { cache: largeCanvasMemCache, kind: "largeCanvas" };
+  }
+  return { cache: canvasMemCache, kind: "canvas" };
+}
+
+function totalMemCacheSize() {
+  return previewMemCache.size() + canvasMemCache.size() + largeCanvasMemCache.size();
+}
 
 // ---------- In-flight dedup ----------
 // Two concurrent requests for the same cache key share ONE sharp job.
@@ -208,6 +227,8 @@ setInterval(() => {   // periodic prune of stale bucket entries
 const startedAt = Date.now();
 const stats = {
   memCacheHits: 0, memCacheMisses: 0,
+  previewMemCacheHits: 0, canvasMemCacheHits: 0, largeCanvasMemCacheHits: 0,
+  previewMemCacheMisses: 0, canvasMemCacheMisses: 0, largeCanvasMemCacheMisses: 0,
   diskCacheHits: 0, diskCacheMisses: 0,
   inFlightDedupes: 0,
   totalPixelizeRequests: 0,
@@ -248,7 +269,18 @@ app.get("/stats", (req, res) => {
     memoryUsageMB: Object.fromEntries(
       Object.entries(process.memoryUsage()).map(([k, v]) => [k, +(v / 1024 / 1024).toFixed(1)])
     ),
-    memCacheSize:  memCache.size(),
+    // memCacheSize is kept as a compatibility alias for existing monitoring.
+    memCacheSize: totalMemCacheSize(),
+    previewMemCacheSize: previewMemCache.size(),
+    canvasMemCacheSize: canvasMemCache.size(),
+    largeCanvasMemCacheSize: largeCanvasMemCache.size(),
+    totalMemCacheSize: totalMemCacheSize(),
+    memoryCacheLimits: {
+      preview: MAX_PREVIEW_CACHE_ITEMS,
+      canvas: MAX_CANVAS_CACHE_ITEMS,
+      largeCanvas: MAX_LARGE_CANVAS_CACHE_ITEMS,
+      largeCanvasMinPixels: LARGE_CANVAS_MIN_PIXELS,
+    },
     diskCacheSize: diskRow.n,
     diskCacheEnabled: !!db,
     inFlightJobs:  inflight.size,
@@ -287,11 +319,22 @@ app.post("/pixelize", async (req, res) => {
     const resizeFit = fit === "contain" ? "contain" : "cover";
     const isCanvas = colors != null && Number(colors) > 0;
     const key = cacheKeyFor({ imageUrl, w, h, fit: resizeFit, colors });
+    const selectedMem = chooseMemoryCache(isCanvas, w, h);
+    const memCache = selectedMem.cache;
 
-    // 1) Memory cache
+    // 1) Memory cache (preview, normal canvas, and large canvas are isolated)
     const memHit = memCache.get(key);
-    if (memHit) { stats.memCacheHits++; return res.json(memHit); }
+    if (memHit) {
+      stats.memCacheHits++;
+      if (selectedMem.kind === "preview") stats.previewMemCacheHits++;
+      else if (selectedMem.kind === "canvas") stats.canvasMemCacheHits++;
+      else stats.largeCanvasMemCacheHits++;
+      return res.json(memHit);
+    }
     stats.memCacheMisses++;
+    if (selectedMem.kind === "preview") stats.previewMemCacheMisses++;
+    else if (selectedMem.kind === "canvas") stats.canvasMemCacheMisses++;
+    else stats.largeCanvasMemCacheMisses++;
 
     // 2) Disk cache -> promote to memory
     const diskHit = loadDisk(key);
@@ -387,7 +430,11 @@ if (db) {
 
 app.listen(PORT, () => {
   console.log(`Pixelize backend v2 on :${PORT}`);
-  console.log(`  memCache max=${MAX_CACHE_ITEMS}  diskCache=${db ? "on" : "off"}`);
+  console.log(
+    `  memCache preview=${MAX_PREVIEW_CACHE_ITEMS} canvas=${MAX_CANVAS_CACHE_ITEMS} ` +
+    `large=${MAX_LARGE_CANVAS_CACHE_ITEMS} (large >= ${LARGE_CANVAS_MIN_PIXELS} px) ` +
+    `diskCache=${db ? "on" : "off"}`
+  );
   console.log(`  concurrency max=${MAX_CONCURRENT_PIXELIZE}  queue max=${MAX_QUEUE_SIZE}`);
   console.log(`  rateLimit=${RATE_LIMIT_PER_MIN}/min  MAX_DIM=${MAX_DIM}`);
 });
