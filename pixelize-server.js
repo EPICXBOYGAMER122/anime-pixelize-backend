@@ -1,5 +1,5 @@
 // =====================================================================
-//  Anime pixelize backend (v2.2 - compressed transport)
+//  Anime pixelize backend (v2.3 - streamed compressed transport)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -33,6 +33,7 @@ const express = require("express");
 const sharp   = require("sharp");
 const zlib    = require("zlib");
 const path    = require("path");
+const { performance, monitorEventLoopDelay } = require("node:perf_hooks");
 
 // SQLite remains optional so the service can still start without native
 // SQLite support, although Oracle should have it installed.
@@ -75,7 +76,7 @@ const PORT = Number(process.env.PORT || 3000);
 // Legacy MAX_CACHE_ITEMS is retained only as a preview-cache fallback.
 const LEGACY_MAX_CACHE_ITEMS = Number(process.env.MAX_CACHE_ITEMS || 0);
 const MAX_PREVIEW_CACHE_ITEMS = Number(
-  process.env.MAX_PREVIEW_CACHE_ITEMS || LEGACY_MAX_CACHE_ITEMS || 120
+  process.env.MAX_PREVIEW_CACHE_ITEMS || LEGACY_MAX_CACHE_ITEMS || 500
 );
 const MAX_CANVAS_CACHE_ITEMS = Number(process.env.MAX_CANVAS_CACHE_ITEMS || 20);
 const MAX_LARGE_CANVAS_CACHE_ITEMS = Number(
@@ -93,6 +94,25 @@ const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 5 * 1024 * 1024);
 const MAX_DIM = Number(process.env.MAX_DIM || 512);
 const MIN_DIM = Number(process.env.MIN_DIM || 8);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "cache.sqlite");
+
+// Stream Base64 in 48 KiB chunks by default. The chunk size is rounded down
+// to a multiple of three so concatenated Base64 chunks never contain padding
+// in the middle of the payload.
+const BASE64_STREAM_CHUNK_BYTES = Math.max(
+  3,
+  Math.floor(
+    Number(process.env.BASE64_STREAM_CHUNK_BYTES || 48 * 1024) / 3
+  ) * 3
+);
+
+// Disk-hit timestamps are deduplicated in memory and written in batches. This
+// removes a synchronous SQLite write from the hottest cache-hit path.
+const DISK_TOUCH_FLUSH_MS = Number(
+  process.env.DISK_TOUCH_FLUSH_MS || 60_000
+);
+const DISK_TOUCH_MIN_INTERVAL_MS = Number(
+  process.env.DISK_TOUCH_MIN_INTERVAL_MS || 10 * 60 * 1000
+);
 
 // Compression levels are deliberately moderate to avoid wasting CPU.
 // Zstd level 3 is a good real-time default; gzip remains the persistent
@@ -124,12 +144,17 @@ const ALLOWED_HOSTS = new Set([
 // pixelsGz is the original gzip-compressed raw RGB storage.
 // pixelsZstd is optional and filled lazily for transport format v2.
 let db = null;
-let getSql;
+let getV1Sql;
+let getV2Sql;
 let putSql;
 let touchSql;
 let countSql;
 let pruneSql;
 let updateZstdSql;
+let flushTouchesTransaction;
+
+const pendingDiskTouches = new Map();
+const lastPersistedDiskTouch = new Map();
 
 if (sqlite) {
   try {
@@ -162,8 +187,11 @@ if (sqlite) {
       console.log("[cache] added pixelsZstd column to existing database");
     }
 
-    getSql = db.prepare(
-      "SELECT pixelsGz, pixelsZstd, w, h FROM cache WHERE key = ?"
+    getV1Sql = db.prepare(
+      "SELECT pixelsGz, w, h FROM cache WHERE key = ?"
+    );
+    getV2Sql = db.prepare(
+      "SELECT pixelsZstd, w, h FROM cache WHERE key = ?"
     );
     putSql = db.prepare(`
       INSERT OR REPLACE INTO cache
@@ -171,6 +199,11 @@ if (sqlite) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     touchSql = db.prepare("UPDATE cache SET lastUsedAt = ? WHERE key = ?");
+    flushTouchesTransaction = db.transaction((entries) => {
+      for (const [key, usedAt] of entries) {
+        touchSql.run(usedAt, key);
+      }
+    });
     updateZstdSql = db.prepare(
       "UPDATE cache SET pixelsZstd = ?, lastUsedAt = ? WHERE key = ?"
     );
@@ -196,18 +229,87 @@ function gunzipRawRgb(pixelsGz) {
   return zlib.gunzipSync(pixelsGz);
 }
 
-function loadDiskEntry(key) {
+function queueDiskTouch(key) {
+  if (!db) return;
+
+  const now = Date.now();
+  const lastPersisted = lastPersistedDiskTouch.get(key) || 0;
+  if (now - lastPersisted < DISK_TOUCH_MIN_INTERVAL_MS) return;
+
+  // Map#set deduplicates repeat hits while preserving the newest timestamp.
+  pendingDiskTouches.set(key, now);
+}
+
+function flushDiskTouches() {
+  if (!db || !flushTouchesTransaction || pendingDiskTouches.size === 0) {
+    return;
+  }
+
+  const entries = Array.from(pendingDiskTouches.entries());
+  pendingDiskTouches.clear();
+
+  try {
+    flushTouchesTransaction(entries);
+    for (const [key, usedAt] of entries) {
+      lastPersistedDiskTouch.set(key, usedAt);
+    }
+    stats.diskTouchBatches++;
+    stats.diskRowsTouched += entries.length;
+  } catch (error) {
+    stats.diskTouchFailures++;
+    console.warn("[cache] touch batch failed -", error.message);
+
+    // Retry later without replacing a newer queued timestamp.
+    for (const [key, usedAt] of entries) {
+      const current = pendingDiskTouches.get(key) || 0;
+      pendingDiskTouches.set(key, Math.max(current, usedAt));
+    }
+  }
+}
+
+function loadDiskEntry(key, formatVersion) {
   if (!db) return null;
 
-  const row = getSql.get(key);
-  if (!row) return null;
+  if (formatVersion === 2) {
+    const zstdRow = getV2Sql.get(key);
+    if (!zstdRow) return null;
 
-  touchSql.run(Date.now(), key);
+    queueDiskTouch(key);
+
+    if (zstdRow.pixelsZstd) {
+      return {
+        width: zstdRow.w,
+        height: zstdRow.h,
+        pixelsGz: null,
+        pixelsZstd: Buffer.from(zstdRow.pixelsZstd),
+        pixels: null,
+        rawRgb: null,
+      };
+    }
+
+    // An older row may not have been lazily upgraded to Zstd yet.
+    const gzipRow = getV1Sql.get(key);
+    if (!gzipRow) return null;
+
+    return {
+      width: gzipRow.w,
+      height: gzipRow.h,
+      pixelsGz: Buffer.from(gzipRow.pixelsGz),
+      pixelsZstd: null,
+      pixels: null,
+      rawRgb: null,
+    };
+  }
+
+  const gzipRow = getV1Sql.get(key);
+  if (!gzipRow) return null;
+
+  queueDiskTouch(key);
   return {
-    width: row.w,
-    height: row.h,
-    pixelsGz: Buffer.from(row.pixelsGz),
-    pixelsZstd: row.pixelsZstd ? Buffer.from(row.pixelsZstd) : null,
+    width: gzipRow.w,
+    height: gzipRow.h,
+    pixelsGz: Buffer.from(gzipRow.pixelsGz),
+    pixelsZstd: null,
     pixels: null,
     rawRgb: null,
   };
@@ -229,11 +331,14 @@ function saveDiskEntry(key, imageUrl, w, h, fit, mode, entry) {
     now,
     now
   );
+  lastPersistedDiskTouch.set(key, now);
 }
 
 function saveDiskZstd(key, pixelsZstd) {
   if (!db) return;
-  updateZstdSql.run(pixelsZstd, Date.now(), key);
+  const now = Date.now();
+  updateZstdSql.run(pixelsZstd, now, key);
+  lastPersistedDiskTouch.set(key, now);
 }
 
 // ---------- Memory LRU ----------
@@ -333,6 +438,10 @@ async function dedupe(key, fn) {
 // ---------- Concurrency semaphore + bounded queue ----------
 let running = 0;
 let queued = 0;
+let activePixelizeResponses = 0;
+let maxActivePixelizeResponses = 0;
+let activeV2Streams = 0;
+let maxActiveV2Streams = 0;
 const waiters = [];
 
 async function withSlot(fn) {
@@ -392,6 +501,101 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref();
 
+// ---------- Latency + event-loop telemetry ----------
+class LatencyWindow {
+  constructor(limit = 2048) {
+    this.limit = limit;
+    this.samples = new Array(limit);
+    this.next = 0;
+    this.size = 0;
+    this.totalCount = 0;
+    this.totalMs = 0;
+    this.maxLifetimeMs = 0;
+  }
+
+  record(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return;
+
+    this.samples[this.next] = ms;
+    this.next = (this.next + 1) % this.limit;
+    this.size = Math.min(this.size + 1, this.limit);
+    this.totalCount++;
+    this.totalMs += ms;
+    this.maxLifetimeMs = Math.max(this.maxLifetimeMs, ms);
+  }
+
+  snapshot() {
+    const values = this.samples
+      .slice(0, this.size)
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+
+    const percentile = (p) => {
+      if (values.length === 0) return null;
+      const index = Math.min(
+        values.length - 1,
+        Math.floor((p / 100) * values.length)
+      );
+      return Number(values[index].toFixed(1));
+    };
+
+    return {
+      lifetimeCount: this.totalCount,
+      lifetimeAverageMs:
+        this.totalCount > 0
+          ? Number((this.totalMs / this.totalCount).toFixed(1))
+          : null,
+      windowSamples: values.length,
+      p50Ms: percentile(50),
+      p95Ms: percentile(95),
+      p99Ms: percentile(99),
+      windowMaxMs:
+        values.length > 0
+          ? Number(values[values.length - 1].toFixed(1))
+          : null,
+      lifetimeMaxMs: Number(this.maxLifetimeMs.toFixed(1)),
+    };
+  }
+}
+
+const latency = {
+  total: new LatencyWindow(),
+  previewMemory: new LatencyWindow(),
+  previewDisk: new LatencyWindow(),
+  previewGenerated: new LatencyWindow(),
+  canvasMemory: new LatencyWindow(),
+  canvasDisk: new LatencyWindow(),
+  canvasGenerated: new LatencyWindow(),
+  largeCanvasMemory: new LatencyWindow(),
+  largeCanvasDisk: new LatencyWindow(),
+  largeCanvasGenerated: new LatencyWindow(),
+  v2StreamWrite: new LatencyWindow(),
+};
+
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelay.enable();
+let lastEventLoopDelayWindow = null;
+
+function readEventLoopDelay() {
+  const toMs = (nanoseconds) =>
+    Number.isFinite(nanoseconds)
+      ? Number((nanoseconds / 1e6).toFixed(1))
+      : null;
+
+  return {
+    meanMs: toMs(eventLoopDelay.mean),
+    p50Ms: toMs(eventLoopDelay.percentile(50)),
+    p95Ms: toMs(eventLoopDelay.percentile(95)),
+    p99Ms: toMs(eventLoopDelay.percentile(99)),
+    maxMs: toMs(eventLoopDelay.max),
+  };
+}
+
+setInterval(() => {
+  lastEventLoopDelayWindow = readEventLoopDelay();
+  eventLoopDelay.reset();
+}, 60_000).unref();
+
 // ---------- Stats ----------
 const startedAt = Date.now();
 const stats = {
@@ -425,7 +629,25 @@ const stats = {
   v2RawBytesRepresented: 0,
   v2CompressedBytesSent: 0,
   v2Base64BytesSent: 0,
+  v2StreamedResponses: 0,
+  v2StreamWriteMs: 0,
+  clientAborts: 0,
+
+  diskTouchBatches: 0,
+  diskRowsTouched: 0,
+  diskTouchFailures: 0,
 };
+
+if (db) {
+  setInterval(flushDiskTouches, DISK_TOUCH_FLUSH_MS).unref();
+
+  setInterval(() => {
+    const cutoff = Date.now() - DISK_TOUCH_MIN_INTERVAL_MS * 2;
+    for (const [key, usedAt] of lastPersistedDiskTouch) {
+      if (usedAt < cutoff) lastPersistedDiskTouch.delete(key);
+    }
+  }, 30 * 60 * 1000).unref();
+}
 
 // ---------- Helpers ----------
 function isAllowedImageUrl(imageUrl) {
@@ -468,14 +690,28 @@ function getRawRgb(entry) {
     return entry.rawRgb;
   }
 
-  const rawRgb = gunzipRawRgb(entry.pixelsGz);
-  validateRawLength(entry, rawRgb);
-  return rawRgb;
+  if (entry.pixelsGz) {
+    const rawRgb = gunzipRawRgb(entry.pixelsGz);
+    validateRawLength(entry, rawRgb);
+    return rawRgb;
+  }
+
+  if (
+    entry.pixelsZstd &&
+    zstdApi &&
+    typeof zstdApi.decompress === "function"
+  ) {
+    const rawRgb = Buffer.from(zstdApi.decompress(entry.pixelsZstd));
+    validateRawLength(entry, rawRgb);
+    return rawRgb;
+  }
+
+  const error = new Error("Pixel cache entry has no decodable payload");
+  error.code = 500;
+  throw error;
 }
 
 function materializeV1Pixels(entry) {
-  if (entry.pixels) return entry.pixels;
-
   const rawRgb = getRawRgb(entry);
   const pixelCount = entry.width * entry.height;
   const pixels = new Array(pixelCount);
@@ -484,8 +720,8 @@ function materializeV1Pixels(entry) {
     pixels[i] = [rawRgb[offset], rawRgb[offset + 1], rawRgb[offset + 2]];
   }
 
-  entry.pixels = pixels;
-  entry.rawRgb = null;
+  // The nested v1 array is intentionally temporary. Retaining it in the
+  // shared LRU would keep hundreds of thousands of small arrays alive.
   stats.v1PixelArraysMaterialized++;
   return pixels;
 }
@@ -493,6 +729,15 @@ function materializeV1Pixels(entry) {
 async function ensureZstdPayload(key, entry) {
   if (entry.pixelsZstd) {
     stats.zstdPayloadCacheHits++;
+
+    // SQLite retains the gzip compatibility copy, so v2 hot-cache entries
+    // only need the Zstd representation.
+    if (db) {
+      entry.pixelsGz = null;
+      entry.pixels = null;
+      entry.rawRgb = null;
+    }
+
     return entry.pixelsZstd;
   }
 
@@ -506,9 +751,13 @@ async function ensureZstdPayload(key, entry) {
   const rawRgb = getRawRgb(entry);
   const compressed = zstdApi.compress(rawRgb, ZSTD_LEVEL);
   entry.pixelsZstd = Buffer.from(compressed);
-  entry.rawRgb = null;
 
   saveDiskZstd(key, entry.pixelsZstd);
+
+  if (db) entry.pixelsGz = null;
+  entry.pixels = null;
+  entry.rawRgb = null;
+
   stats.zstdPayloadCompressions++;
   return entry.pixelsZstd;
 }
@@ -522,12 +771,52 @@ function sendV1Response(res, entry) {
   });
 }
 
-async function sendV2Response(res, key, entry) {
-  const pixelsZstd = await ensureZstdPayload(key, entry);
-  const pixelsBase64 = pixelsZstd.toString("base64");
-  const rawBytes = entry.width * entry.height * 3;
+function writeResponseChunk(res, chunk) {
+  if (res.destroyed || res.writableEnded) {
+    const error = new Error("client disconnected");
+    error.clientAborted = true;
+    return Promise.reject(error);
+  }
 
-  const payload = {
+  if (res.write(chunk)) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      res.off("error", onError);
+    };
+
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+
+    const onClose = () => {
+      cleanup();
+      const error = new Error("client disconnected");
+      error.clientAborted = true;
+      reject(error);
+    };
+
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    res.once("error", onError);
+  });
+}
+
+async function sendV2Response(res, key, entry) {
+  const responseStartedAt = performance.now();
+  const pixelsZstd = await ensureZstdPayload(key, entry);
+  const rawBytes = entry.width * entry.height * 3;
+  const base64Bytes = Math.ceil(pixelsZstd.length / 3) * 4;
+
+  const metadata = {
     formatVersion: 2,
     encoding: "rgb24",
     compression: "zstd",
@@ -537,17 +826,52 @@ async function sendV2Response(res, key, entry) {
     pixelCount: entry.width * entry.height,
     uncompressedBytes: rawBytes,
     compressedBytes: pixelsZstd.length,
-    pixelsBase64,
   };
 
-  stats.formatV2Responses++;
-  stats.v2RawBytesRepresented += rawBytes;
-  stats.v2CompressedBytesSent += pixelsZstd.length;
-  stats.v2Base64BytesSent += Buffer.byteLength(pixelsBase64, "ascii");
+  const metadataJson = JSON.stringify(metadata);
+  const prefix = metadataJson.slice(0, -1) + ',"pixelsBase64":"';
+  const suffix = '"}';
+  const contentLength =
+    Buffer.byteLength(prefix, "utf8") +
+    base64Bytes +
+    Buffer.byteLength(suffix, "utf8");
 
-  // Sending a prepared JSON string lets /stats account for the exact
-  // Base64 payload size and avoids Express inspecting a Buffer object.
-  return res.type("application/json").send(JSON.stringify(payload));
+  activeV2Streams++;
+  maxActiveV2Streams = Math.max(maxActiveV2Streams, activeV2Streams);
+
+  try {
+    res.status(200);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Length", String(contentLength));
+
+    await writeResponseChunk(res, prefix);
+
+    for (
+      let offset = 0;
+      offset < pixelsZstd.length;
+      offset += BASE64_STREAM_CHUNK_BYTES
+    ) {
+      const end = Math.min(
+        offset + BASE64_STREAM_CHUNK_BYTES,
+        pixelsZstd.length
+      );
+      const encodedChunk = pixelsZstd.subarray(offset, end).toString("base64");
+      await writeResponseChunk(res, encodedChunk);
+    }
+
+    res.end(suffix);
+
+    const elapsed = performance.now() - responseStartedAt;
+    stats.formatV2Responses++;
+    stats.v2RawBytesRepresented += rawBytes;
+    stats.v2CompressedBytesSent += pixelsZstd.length;
+    stats.v2Base64BytesSent += base64Bytes;
+    stats.v2StreamedResponses++;
+    stats.v2StreamWriteMs += elapsed;
+    latency.v2StreamWrite.record(elapsed);
+  } finally {
+    activeV2Streams--;
+  }
 }
 
 async function sendPixelResponse(res, key, entry, formatVersion) {
@@ -566,7 +890,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     message: "Anime pixelize backend is running",
-    apiVersion: "2.2",
+    apiVersion: "2.3",
     pixelFormats: {
       default: 1,
       supported: hasZstd() ? [1, 2] : [1],
@@ -632,11 +956,58 @@ app.get("/stats", (req, res) => {
       perMinute: RATE_LIMIT_PER_MIN,
       bucketsTracked: buckets.size,
     },
+    pendingDiskTouches: pendingDiskTouches.size,
+    httpResponses: {
+      activePixelize: activePixelizeResponses,
+      maxActivePixelize: maxActivePixelizeResponses,
+      activeV2Streams,
+      maxActiveV2Streams,
+    },
+    latencyMs: Object.fromEntries(
+      Object.entries(latency).map(([name, collector]) => [
+        name,
+        collector.snapshot(),
+      ])
+    ),
+    eventLoopDelay: {
+      last60Seconds: lastEventLoopDelayWindow,
+      currentWindow: readEventLoopDelay(),
+    },
     counters: { ...stats },
   });
 });
 
 app.post("/pixelize", async (req, res) => {
+  const requestStartedAt = performance.now();
+  const requestTelemetry = { kind: null, source: null };
+  let responseFinalized = false;
+
+  activePixelizeResponses++;
+  maxActivePixelizeResponses = Math.max(
+    maxActivePixelizeResponses,
+    activePixelizeResponses
+  );
+
+  const finalizeResponseTelemetry = () => {
+    if (responseFinalized) return;
+    responseFinalized = true;
+
+    activePixelizeResponses = Math.max(0, activePixelizeResponses - 1);
+    const elapsed = performance.now() - requestStartedAt;
+    latency.total.record(elapsed);
+
+    if (requestTelemetry.kind && requestTelemetry.source) {
+      const key =
+        requestTelemetry.kind +
+        requestTelemetry.source[0].toUpperCase() +
+        requestTelemetry.source.slice(1);
+      if (latency[key]) latency[key].record(elapsed);
+    }
+  };
+
+  res.once("finish", finalizeResponseTelemetry);
+  res.once("close", finalizeResponseTelemetry);
+
   const ip = req.ip || req.connection?.remoteAddress || "unknown";
   if (!rateLimit(ip)) {
     stats.rateLimited++;
@@ -699,18 +1070,12 @@ app.post("/pixelize", async (req, res) => {
 
     const resizeFit = fit === "contain" ? "contain" : "cover";
     const isCanvas = colors != null && Number(colors) > 0;
-    const key = cacheKeyFor({
-      imageUrl,
-      w,
-      h,
-      fit: resizeFit,
-      colors,
-    });
-
+    const key = cacheKeyFor({ imageUrl, w, h, fit: resizeFit, colors });
     const selectedMem = chooseMemoryCache(isCanvas, w, h);
     const memCache = selectedMem.cache;
+    const cacheTtl = isCanvas ? TTL_CANVAS_MS : TTL_PREVIEW_MS;
 
-    // 1) Memory cache
+    // 1) Memory cache.
     const memHit = memCache.get(key);
     if (memHit) {
       stats.memCacheHits++;
@@ -718,6 +1083,8 @@ app.post("/pixelize", async (req, res) => {
       else if (selectedMem.kind === "canvas") stats.canvasMemCacheHits++;
       else stats.largeCanvasMemCacheHits++;
 
+      requestTelemetry.kind = selectedMem.kind;
+      requestTelemetry.source = "memory";
       return await sendPixelResponse(res, key, memHit, formatVersion);
     }
 
@@ -726,36 +1093,29 @@ app.post("/pixelize", async (req, res) => {
     else if (selectedMem.kind === "canvas") stats.canvasMemCacheMisses++;
     else stats.largeCanvasMemCacheMisses++;
 
-    // 2) Disk cache. Version 2 can return pixelsZstd directly without
-    // rebuilding the giant pixels array.
-    const diskHit = loadDiskEntry(key);
+    // 2) Format-aware disk cache. v2 normally reads only the Zstd column.
+    const diskHit = loadDiskEntry(key, formatVersion);
     if (diskHit) {
       stats.diskCacheHits++;
-      memCache.set(
-        key,
-        diskHit,
-        isCanvas ? TTL_CANVAS_MS : TTL_PREVIEW_MS
-      );
+      memCache.set(key, diskHit, cacheTtl);
+      requestTelemetry.kind = selectedMem.kind;
+      requestTelemetry.source = "disk";
       return await sendPixelResponse(res, key, diskHit, formatVersion);
     }
 
     stats.diskCacheMisses++;
 
-    // 3) Shared image processing job. Response formatting happens after
-    // dedupe, so v1 and v2 callers can share the same generated RGB data.
-    const entry = await dedupe(key, () =>
+    // 3) Shared image-processing job. A late cache result is returned with
+    // its source so latency telemetry does not mislabel it as generated.
+    const resolved = await dedupe(key, () =>
       withSlot(async () => {
         const lateMem = memCache.get(key);
-        if (lateMem) return lateMem;
+        if (lateMem) return { entry: lateMem, source: "memory" };
 
-        const lateDisk = loadDiskEntry(key);
+        const lateDisk = loadDiskEntry(key, formatVersion);
         if (lateDisk) {
-          memCache.set(
-            key,
-            lateDisk,
-            isCanvas ? TTL_CANVAS_MS : TTL_PREVIEW_MS
-          );
-          return lateDisk;
+          memCache.set(key, lateDisk, cacheTtl);
+          return { entry: lateDisk, source: "disk" };
         }
 
         const controller = new AbortController();
@@ -766,7 +1126,7 @@ app.post("/pixelize", async (req, res) => {
           imageResponse = await fetch(imageUrl, {
             signal: controller.signal,
             headers: {
-              "User-Agent": "AnimePixelizeBackend/2.2",
+              "User-Agent": "AnimePixelizeBackend/2.3",
             },
           });
         } finally {
@@ -817,7 +1177,8 @@ app.post("/pixelize", async (req, res) => {
           .raw()
           .toBuffer({ resolveWithObject: true });
 
-        const rawRgb = Buffer.from(raw.data);
+        // raw.data is already a Buffer; avoid a second full RGB allocation.
+        const rawRgb = raw.data;
         const generatedEntry = {
           width: raw.info.width,
           height: raw.info.height,
@@ -829,23 +1190,16 @@ app.post("/pixelize", async (req, res) => {
 
         validateRawLength(generatedEntry, rawRgb);
 
-        // Only create Zstd during a v2 request. This means deploying the
-        // backend update does not add compression CPU cost to the current
-        // live v1 game before the Roblox scripts are updated.
         if (formatVersion === 2) {
           generatedEntry.pixelsZstd = Buffer.from(
             zstdApi.compress(rawRgb, ZSTD_LEVEL)
           );
-          generatedEntry.rawRgb = null;
           stats.zstdPayloadCompressions++;
         }
 
         const mode = isCanvas ? `${Number(colors)}colors` : "preview";
-        memCache.set(
-          key,
-          generatedEntry,
-          isCanvas ? TTL_CANVAS_MS : TTL_PREVIEW_MS
-        );
+
+        // Save the required gzip compatibility representation first.
         saveDiskEntry(
           key,
           imageUrl,
@@ -856,15 +1210,42 @@ app.post("/pixelize", async (req, res) => {
           generatedEntry
         );
 
+        // Once persisted, a v2 hot entry keeps only Zstd in memory.
+        if (formatVersion === 2 && db) {
+          generatedEntry.pixelsGz = null;
+          generatedEntry.rawRgb = null;
+          generatedEntry.pixels = null;
+        }
+
+        memCache.set(key, generatedEntry, cacheTtl);
         stats.totalPixelsProcessed +=
           generatedEntry.width * generatedEntry.height;
 
-        return generatedEntry;
+        return { entry: generatedEntry, source: "generated" };
       })
     );
 
-    return await sendPixelResponse(res, key, entry, formatVersion);
+    requestTelemetry.kind = selectedMem.kind;
+    requestTelemetry.source = resolved.source;
+    return await sendPixelResponse(
+      res,
+      key,
+      resolved.entry,
+      formatVersion
+    );
   } catch (error) {
+    if (error?.clientAborted || res.destroyed) {
+      stats.clientAborts++;
+      return;
+    }
+
+    if (res.headersSent) {
+      stats.failedJobs++;
+      console.error("[pixelize-after-headers]", error);
+      if (!res.destroyed) res.destroy(error);
+      return;
+    }
+
     if (error && error.code === 503) {
       if (error.compressionUnavailable) stats.formatV2Unavailable++;
       else stats.serverBusy++;
@@ -907,13 +1288,16 @@ if (db) {
   }, DISK_PRUNE_INTERVAL_MS).unref();
 }
 
+let httpServer = null;
+let shuttingDown = false;
+
 async function startServer() {
   // Initialise the portable WebAssembly compressor before accepting v2
   // traffic. If it fails, v1 still starts normally.
   await initialiseZstd();
 
-  app.listen(PORT, () => {
-    console.log(`Pixelize backend v2.2 on :${PORT}`);
+  httpServer = app.listen(PORT, () => {
+    console.log(`Pixelize backend v2.3 on :${PORT}`);
     console.log(
       `  memCache preview=${MAX_PREVIEW_CACHE_ITEMS} ` +
         `canvas=${MAX_CANVAS_CACHE_ITEMS} ` +
@@ -933,6 +1317,41 @@ async function startServer() {
     );
   });
 }
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal}`);
+
+  try {
+    flushDiskTouches();
+  } catch (error) {
+    console.warn("[shutdown] final touch flush failed -", error.message);
+  }
+
+  const finish = () => {
+    try {
+      flushDiskTouches();
+      if (db && db.open) db.close();
+    } catch (error) {
+      console.warn("[shutdown] cache close failed -", error.message);
+    }
+    process.exit(0);
+  };
+
+  if (httpServer) {
+    httpServer.close(finish);
+    setTimeout(() => {
+      console.warn("[shutdown] forcing exit after timeout");
+      finish();
+    }, 10_000).unref();
+  } else {
+    finish();
+  }
+}
+
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));
 
 startServer().catch((error) => {
   console.error("[startup] fatal error", error);
