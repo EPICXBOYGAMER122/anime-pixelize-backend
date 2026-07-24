@@ -1,5 +1,5 @@
 // =====================================================================
-//  Anime pixelize backend (v2.3 - streamed compressed transport)
+//  Anime pixelize backend (v2.4 - streamed transport + memory telemetry)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -33,7 +33,12 @@ const express = require("express");
 const sharp   = require("sharp");
 const zlib    = require("zlib");
 const path    = require("path");
-const { performance, monitorEventLoopDelay } = require("node:perf_hooks");
+const {
+  performance,
+  monitorEventLoopDelay,
+  PerformanceObserver,
+  constants: perfConstants,
+} = require("node:perf_hooks");
 
 // SQLite remains optional so the service can still start without native
 // SQLite support, although Oracle should have it installed.
@@ -95,6 +100,52 @@ const MAX_DIM = Number(process.env.MAX_DIM || 512);
 const MIN_DIM = Number(process.env.MIN_DIM || 8);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "cache.sqlite");
 
+
+// Memory telemetry is intentionally bounded and kept only in process memory.
+// RSS is sampled more frequently because it represents the complete resident
+// process size, while the full V8 memory breakdown is sampled every 250 ms.
+const MEMORY_RSS_SAMPLE_MS = Math.max(
+  50,
+  Number(process.env.MEMORY_RSS_SAMPLE_MS || 100)
+);
+const MEMORY_FULL_SAMPLE_MS = Math.max(
+  100,
+  Number(process.env.MEMORY_FULL_SAMPLE_MS || 250)
+);
+const MEMORY_WINDOW_MS = 15 * 60 * 1000;
+const MEMORY_SPIKE_LOOKBACK_MS = Math.max(
+  500,
+  Number(process.env.MEMORY_SPIKE_LOOKBACK_MS || 1000)
+);
+const MEMORY_HEAP_SPIKE_MB = Math.max(
+  1,
+  Number(process.env.MEMORY_HEAP_SPIKE_MB || 15)
+);
+const MEMORY_RSS_SPIKE_MB = Math.max(
+  1,
+  Number(process.env.MEMORY_RSS_SPIKE_MB || 40)
+);
+const MEMORY_SPIKE_RECOVERY_HEAP_MB = Math.max(
+  1,
+  Number(process.env.MEMORY_SPIKE_RECOVERY_HEAP_MB || 5)
+);
+const MEMORY_SPIKE_RECOVERY_RSS_MB = Math.max(
+  1,
+  Number(process.env.MEMORY_SPIKE_RECOVERY_RSS_MB || 15)
+);
+const MEMORY_SPIKE_MAX_DURATION_MS = Math.max(
+  1000,
+  Number(process.env.MEMORY_SPIKE_MAX_DURATION_MS || 30_000)
+);
+const MEMORY_RECENT_SPIKE_LIMIT = Math.max(
+  5,
+  Number(process.env.MEMORY_RECENT_SPIKE_LIMIT || 50)
+);
+const GC_LONG_PAUSE_MS = Math.max(
+  1,
+  Number(process.env.GC_LONG_PAUSE_MS || 50)
+);
+
 // Stream Base64 in 48 KiB chunks by default. The chunk size is rounded down
 // to a multiple of three so concatenated Base64 chunks never contain padding
 // in the middle of the payload.
@@ -139,6 +190,53 @@ const ALLOWED_HOSTS = new Set([
   "s4.anilist.co",
   "cdn.myanimelist.net",
 ]);
+
+
+// ---------- Active-operation telemetry ----------
+const OPERATION_NAMES = [
+  "imageDownloads",
+  "sharpJobs",
+  "gzipCompressions",
+  "gzipDecompressions",
+  "zstdCompressions",
+  "zstdDecompressions",
+  "v1PixelArrays",
+  "v1Responses",
+  "previewGenerations",
+  "canvasGenerations",
+  "largeCanvasGenerations",
+];
+
+const operationTelemetry = {
+  active: Object.fromEntries(OPERATION_NAMES.map((name) => [name, 0])),
+  lifetimePeak: Object.fromEntries(OPERATION_NAMES.map((name) => [name, 0])),
+};
+
+function beginOperation(name) {
+  if (!(name in operationTelemetry.active)) return;
+  operationTelemetry.active[name]++;
+  operationTelemetry.lifetimePeak[name] = Math.max(
+    operationTelemetry.lifetimePeak[name],
+    operationTelemetry.active[name]
+  );
+}
+
+function endOperation(name) {
+  if (!(name in operationTelemetry.active)) return;
+  operationTelemetry.active[name] = Math.max(
+    0,
+    operationTelemetry.active[name] - 1
+  );
+}
+
+function withSyncOperation(name, fn) {
+  beginOperation(name);
+  try {
+    return fn();
+  } finally {
+    endOperation(name);
+  }
+}
 
 // ---------- SQLite persistent cache ----------
 // pixelsGz is the original gzip-compressed raw RGB storage.
@@ -222,11 +320,15 @@ if (sqlite) {
 }
 
 function gzipRawRgb(rawRgb) {
-  return zlib.gzipSync(rawRgb, { level: GZIP_LEVEL });
+  return withSyncOperation("gzipCompressions", () =>
+    zlib.gzipSync(rawRgb, { level: GZIP_LEVEL })
+  );
 }
 
 function gunzipRawRgb(pixelsGz) {
-  return zlib.gunzipSync(pixelsGz);
+  return withSyncOperation("gzipDecompressions", () =>
+    zlib.gunzipSync(pixelsGz)
+  );
 }
 
 function queueDiskTouch(key) {
@@ -638,6 +740,408 @@ const stats = {
   diskTouchFailures: 0,
 };
 
+// ---------- Peak memory, spike and garbage-collection telemetry ----------
+const BYTES_PER_MB = 1024 * 1024;
+const fullMemorySamples = [];
+const rssSamples = [];
+const recentMemorySpikes = [];
+const recentGcEvents = [];
+const recentLongGcPauses = [];
+let activeMemorySpike = null;
+let spikeRecoverySamples = 0;
+
+const lifetimeMemoryPeaksMB = {
+  rss: 0,
+  heapTotal: 0,
+  heapUsed: 0,
+  external: 0,
+  arrayBuffers: 0,
+};
+
+const gcTelemetry = {
+  supported: typeof PerformanceObserver === "function",
+  lifetimeCount: 0,
+  lifetimeTotalMs: 0,
+  lifetimeMaxMs: 0,
+};
+
+function bytesToMB(bytes) {
+  return Number((Number(bytes || 0) / BYTES_PER_MB).toFixed(1));
+}
+
+function memoryUsageToMB(memory) {
+  return {
+    rss: bytesToMB(memory.rss),
+    heapTotal: bytesToMB(memory.heapTotal),
+    heapUsed: bytesToMB(memory.heapUsed),
+    external: bytesToMB(memory.external),
+    arrayBuffers: bytesToMB(memory.arrayBuffers),
+  };
+}
+
+function memoryValuesOnly(sample) {
+  return {
+    rss: sample.rss,
+    heapTotal: sample.heapTotal,
+    heapUsed: sample.heapUsed,
+    external: sample.external,
+    arrayBuffers: sample.arrayBuffers,
+  };
+}
+
+function operationSnapshot() {
+  return {
+    ...operationTelemetry.active,
+    running,
+    queued,
+    inFlightJobs: inflight.size,
+    activePixelizeResponses,
+    activeV2Streams,
+  };
+}
+
+function updateOperationPeaks(target) {
+  const current = operationSnapshot();
+  for (const [name, value] of Object.entries(current)) {
+    target[name] = Math.max(target[name] || 0, Number(value) || 0);
+  }
+}
+
+function updateLifetimeMemoryPeaks(sample) {
+  for (const key of Object.keys(lifetimeMemoryPeaksMB)) {
+    lifetimeMemoryPeaksMB[key] = Math.max(
+      lifetimeMemoryPeaksMB[key],
+      Number(sample[key]) || 0
+    );
+  }
+}
+
+function pruneTimedSamples(samples, now, maxAgeMs = MEMORY_WINDOW_MS) {
+  const cutoff = now - maxAgeMs;
+  let removeCount = 0;
+  while (
+    removeCount < samples.length &&
+    samples[removeCount].timestampMs < cutoff
+  ) {
+    removeCount++;
+  }
+  if (removeCount > 0) samples.splice(0, removeCount);
+}
+
+function memoryPeakSnapshot(windowMs) {
+  const cutoff = Date.now() - windowMs;
+  const result = {
+    rss: null,
+    heapTotal: null,
+    heapUsed: null,
+    external: null,
+    arrayBuffers: null,
+  };
+
+  for (const sample of fullMemorySamples) {
+    if (sample.timestampMs < cutoff) continue;
+    for (const key of ["heapTotal", "heapUsed", "external", "arrayBuffers"]) {
+      result[key] = Math.max(result[key] ?? 0, sample[key]);
+    }
+    result.rss = Math.max(result.rss ?? 0, sample.rss);
+  }
+
+  // The dedicated 100 ms RSS sampler may catch a shorter native-memory peak.
+  for (const sample of rssSamples) {
+    if (sample.timestampMs < cutoff) continue;
+    result.rss = Math.max(result.rss ?? 0, sample.rss);
+  }
+
+  return result;
+}
+
+function gcKindName(kind) {
+  const mapping = new Map([
+    [perfConstants?.NODE_PERFORMANCE_GC_MAJOR, "major"],
+    [perfConstants?.NODE_PERFORMANCE_GC_MINOR, "minor"],
+    [perfConstants?.NODE_PERFORMANCE_GC_INCREMENTAL, "incremental"],
+    [perfConstants?.NODE_PERFORMANCE_GC_WEAKCB, "weakCallbacks"],
+  ]);
+  return mapping.get(kind) || `kind-${kind ?? "unknown"}`;
+}
+
+function garbageCollectionSnapshot() {
+  const cutoff = Date.now() - 60_000;
+  const lastMinute = recentGcEvents.filter((event) => event.timestampMs >= cutoff);
+  const lastMinuteTotalMs = lastMinute.reduce(
+    (total, event) => total + event.durationMs,
+    0
+  );
+  const lastMinuteMaxMs = lastMinute.reduce(
+    (maximum, event) => Math.max(maximum, event.durationMs),
+    0
+  );
+
+  return {
+    supported: gcTelemetry.supported,
+    lifetimeCount: gcTelemetry.lifetimeCount,
+    lifetimeTotalMs: Number(gcTelemetry.lifetimeTotalMs.toFixed(1)),
+    lifetimeMaxMs: Number(gcTelemetry.lifetimeMaxMs.toFixed(1)),
+    last60SecondsCount: lastMinute.length,
+    last60SecondsTotalMs: Number(lastMinuteTotalMs.toFixed(1)),
+    last60SecondsMaxMs: Number(lastMinuteMaxMs.toFixed(1)),
+    longPauseThresholdMs: GC_LONG_PAUSE_MS,
+    recentLongPauses: recentLongGcPauses.slice(-20).reverse(),
+  };
+}
+
+function startMemorySpike(current, before, trigger, now) {
+  activeMemorySpike = {
+    startedAtMs: now,
+    startedAt: new Date(now).toISOString(),
+    trigger,
+    beforeMB: memoryValuesOnly(before),
+    peakMB: memoryValuesOnly(current),
+    operationsAtStart: operationSnapshot(),
+    operationPeaks: {},
+    gcStartCount: gcTelemetry.lifetimeCount,
+    gcStartTotalMs: gcTelemetry.lifetimeTotalMs,
+    gcStartMaxMs: gcTelemetry.lifetimeMaxMs,
+  };
+  updateOperationPeaks(activeMemorySpike.operationPeaks);
+  spikeRecoverySamples = 0;
+}
+
+function finishMemorySpike(current, now, reason) {
+  if (!activeMemorySpike) return;
+
+  const spike = activeMemorySpike;
+  const gcEventsDuring = recentGcEvents.filter(
+    (event) => event.timestampMs >= spike.startedAtMs && event.timestampMs <= now
+  );
+
+  const completed = {
+    startedAt: spike.startedAt,
+    endedAt: new Date(now).toISOString(),
+    durationMs: Math.max(0, now - spike.startedAtMs),
+    endedReason: reason,
+    trigger: spike.trigger,
+    beforeMB: spike.beforeMB,
+    peakMB: spike.peakMB,
+    afterMB: memoryValuesOnly(current),
+    operationsAtStart: spike.operationsAtStart,
+    operationPeaks: spike.operationPeaks,
+    garbageCollection: {
+      count: gcTelemetry.lifetimeCount - spike.gcStartCount,
+      totalMs: Number(
+        (gcTelemetry.lifetimeTotalMs - spike.gcStartTotalMs).toFixed(1)
+      ),
+      maxMs: Number(
+        gcEventsDuring.reduce(
+          (maximum, event) => Math.max(maximum, event.durationMs),
+          0
+        ).toFixed(1)
+      ),
+    },
+  };
+
+  recentMemorySpikes.push(completed);
+  while (recentMemorySpikes.length > MEMORY_RECENT_SPIKE_LIMIT) {
+    recentMemorySpikes.shift();
+  }
+
+  if (completed.peakMB.heapUsed >= 75 || completed.peakMB.rss >= 750) {
+    console.warn(
+      `[memory] notable spike heap=${completed.peakMB.heapUsed}MB ` +
+        `rss=${completed.peakMB.rss}MB duration=${completed.durationMs}ms`
+    );
+  }
+
+  activeMemorySpike = null;
+  spikeRecoverySamples = 0;
+}
+
+function recordFullMemorySample() {
+  const now = Date.now();
+  const current = {
+    timestampMs: now,
+    ...memoryUsageToMB(process.memoryUsage()),
+  };
+
+  fullMemorySamples.push(current);
+  pruneTimedSamples(fullMemorySamples, now);
+  updateLifetimeMemoryPeaks(current);
+
+  const lookbackCutoff = now - MEMORY_SPIKE_LOOKBACK_MS;
+  const lookback = fullMemorySamples.filter(
+    (sample) => sample.timestampMs >= lookbackCutoff && sample.timestampMs < now
+  );
+
+  if (!activeMemorySpike && lookback.length > 0) {
+    const before = {
+      rss: Math.min(...lookback.map((sample) => sample.rss)),
+      heapTotal: Math.min(...lookback.map((sample) => sample.heapTotal)),
+      heapUsed: Math.min(...lookback.map((sample) => sample.heapUsed)),
+      external: Math.min(...lookback.map((sample) => sample.external)),
+      arrayBuffers: Math.min(...lookback.map((sample) => sample.arrayBuffers)),
+    };
+    const heapIncrease = current.heapUsed - before.heapUsed;
+    const rssIncrease = current.rss - before.rss;
+
+    if (
+      heapIncrease >= MEMORY_HEAP_SPIKE_MB ||
+      rssIncrease >= MEMORY_RSS_SPIKE_MB
+    ) {
+      startMemorySpike(
+        current,
+        before,
+        {
+          heapIncreaseMB: Number(heapIncrease.toFixed(1)),
+          rssIncreaseMB: Number(rssIncrease.toFixed(1)),
+        },
+        now
+      );
+    }
+  }
+
+  if (activeMemorySpike) {
+    for (const key of ["rss", "heapTotal", "heapUsed", "external", "arrayBuffers"]) {
+      activeMemorySpike.peakMB[key] = Math.max(
+        activeMemorySpike.peakMB[key],
+        current[key]
+      );
+    }
+    updateOperationPeaks(activeMemorySpike.operationPeaks);
+
+    const heapRecovered =
+      current.heapUsed <=
+      activeMemorySpike.beforeMB.heapUsed + MEMORY_SPIKE_RECOVERY_HEAP_MB;
+    const rssRecovered =
+      current.rss <=
+      activeMemorySpike.beforeMB.rss + MEMORY_SPIKE_RECOVERY_RSS_MB;
+
+    const requiresHeapRecovery =
+      activeMemorySpike.trigger.heapIncreaseMB >= MEMORY_HEAP_SPIKE_MB;
+    const requiresRssRecovery =
+      activeMemorySpike.trigger.rssIncreaseMB >= MEMORY_RSS_SPIKE_MB;
+    const recovered =
+      (!requiresHeapRecovery || heapRecovered) &&
+      (!requiresRssRecovery || rssRecovered);
+
+    if (recovered) spikeRecoverySamples++;
+    else spikeRecoverySamples = 0;
+
+    if (spikeRecoverySamples >= 3) {
+      finishMemorySpike(current, now, "recovered");
+    } else if (
+      now - activeMemorySpike.startedAtMs >= MEMORY_SPIKE_MAX_DURATION_MS
+    ) {
+      finishMemorySpike(current, now, "timeout");
+    }
+  }
+}
+
+function recordRssSample() {
+  const now = Date.now();
+  const rssBytes =
+    typeof process.memoryUsage.rss === "function"
+      ? process.memoryUsage.rss()
+      : process.memoryUsage().rss;
+  const rss = bytesToMB(rssBytes);
+  rssSamples.push({ timestampMs: now, rss });
+  pruneTimedSamples(rssSamples, now);
+  lifetimeMemoryPeaksMB.rss = Math.max(lifetimeMemoryPeaksMB.rss, rss);
+}
+
+function activeMemorySpikeSnapshot() {
+  if (!activeMemorySpike) return null;
+  return {
+    startedAt: activeMemorySpike.startedAt,
+    durationMs: Date.now() - activeMemorySpike.startedAtMs,
+    trigger: activeMemorySpike.trigger,
+    beforeMB: activeMemorySpike.beforeMB,
+    peakMB: activeMemorySpike.peakMB,
+    operationsAtStart: activeMemorySpike.operationsAtStart,
+    operationPeaks: activeMemorySpike.operationPeaks,
+    garbageCollectionCountSoFar:
+      gcTelemetry.lifetimeCount - activeMemorySpike.gcStartCount,
+  };
+}
+
+function memoryTelemetrySnapshot() {
+  return {
+    sampling: {
+      rssEveryMs: MEMORY_RSS_SAMPLE_MS,
+      fullMemoryEveryMs: MEMORY_FULL_SAMPLE_MS,
+      rollingWindowMinutes: MEMORY_WINDOW_MS / 60_000,
+      retainedFullSamples: fullMemorySamples.length,
+      retainedRssSamples: rssSamples.length,
+    },
+    spikeDetection: {
+      lookbackMs: MEMORY_SPIKE_LOOKBACK_MS,
+      heapIncreaseMB: MEMORY_HEAP_SPIKE_MB,
+      rssIncreaseMB: MEMORY_RSS_SPIKE_MB,
+      recoveryHeapAboveBaselineMB: MEMORY_SPIKE_RECOVERY_HEAP_MB,
+      recoveryRssAboveBaselineMB: MEMORY_SPIKE_RECOVERY_RSS_MB,
+      maximumDurationMs: MEMORY_SPIKE_MAX_DURATION_MS,
+      recentSpikeLimit: MEMORY_RECENT_SPIKE_LIMIT,
+    },
+    peaksMB: {
+      last60Seconds: memoryPeakSnapshot(60_000),
+      last15Minutes: memoryPeakSnapshot(MEMORY_WINDOW_MS),
+      lifetime: { ...lifetimeMemoryPeaksMB },
+    },
+    activeSpike: activeMemorySpikeSnapshot(),
+    recentSpikes: recentMemorySpikes.slice().reverse(),
+  };
+}
+
+let gcObserver = null;
+if (gcTelemetry.supported) {
+  try {
+    gcObserver = new PerformanceObserver((list) => {
+      const now = Date.now();
+      for (const entry of list.getEntries()) {
+        const durationMs = Number(entry.duration || 0);
+        const kind = entry.detail?.kind ?? entry.kind;
+        const event = {
+          timestampMs: now,
+          time: new Date(now).toISOString(),
+          kind: gcKindName(kind),
+          durationMs: Number(durationMs.toFixed(1)),
+        };
+
+        gcTelemetry.lifetimeCount++;
+        gcTelemetry.lifetimeTotalMs += durationMs;
+        gcTelemetry.lifetimeMaxMs = Math.max(
+          gcTelemetry.lifetimeMaxMs,
+          durationMs
+        );
+
+        recentGcEvents.push(event);
+        pruneTimedSamples(recentGcEvents, now, 60_000);
+
+        if (durationMs >= GC_LONG_PAUSE_MS) {
+          recentLongGcPauses.push({
+            time: event.time,
+            kind: event.kind,
+            durationMs: event.durationMs,
+            memoryUsageMB: memoryUsageToMB(process.memoryUsage()),
+            operations: operationSnapshot(),
+          });
+          while (recentLongGcPauses.length > 50) {
+            recentLongGcPauses.shift();
+          }
+        }
+      }
+    });
+    gcObserver.observe({ entryTypes: ["gc"] });
+  } catch (error) {
+    gcTelemetry.supported = false;
+    console.warn("[telemetry] GC observer unavailable -", error.message);
+  }
+}
+
+recordRssSample();
+recordFullMemorySample();
+setInterval(recordRssSample, MEMORY_RSS_SAMPLE_MS).unref();
+setInterval(recordFullMemorySample, MEMORY_FULL_SAMPLE_MS).unref();
+
 if (db) {
   setInterval(flushDiskTouches, DISK_TOUCH_FLUSH_MS).unref();
 
@@ -701,7 +1205,9 @@ function getRawRgb(entry) {
     zstdApi &&
     typeof zstdApi.decompress === "function"
   ) {
-    const rawRgb = Buffer.from(zstdApi.decompress(entry.pixelsZstd));
+    const rawRgb = withSyncOperation("zstdDecompressions", () =>
+      Buffer.from(zstdApi.decompress(entry.pixelsZstd))
+    );
     validateRawLength(entry, rawRgb);
     return rawRgb;
   }
@@ -712,18 +1218,20 @@ function getRawRgb(entry) {
 }
 
 function materializeV1Pixels(entry) {
-  const rawRgb = getRawRgb(entry);
-  const pixelCount = entry.width * entry.height;
-  const pixels = new Array(pixelCount);
+  return withSyncOperation("v1PixelArrays", () => {
+    const rawRgb = getRawRgb(entry);
+    const pixelCount = entry.width * entry.height;
+    const pixels = new Array(pixelCount);
 
-  for (let i = 0, offset = 0; i < pixelCount; i++, offset += 3) {
-    pixels[i] = [rawRgb[offset], rawRgb[offset + 1], rawRgb[offset + 2]];
-  }
+    for (let i = 0, offset = 0; i < pixelCount; i++, offset += 3) {
+      pixels[i] = [rawRgb[offset], rawRgb[offset + 1], rawRgb[offset + 2]];
+    }
 
-  // The nested v1 array is intentionally temporary. Retaining it in the
-  // shared LRU would keep hundreds of thousands of small arrays alive.
-  stats.v1PixelArraysMaterialized++;
-  return pixels;
+    // The nested v1 array is intentionally temporary. Retaining it in the
+    // shared LRU would keep hundreds of thousands of small arrays alive.
+    stats.v1PixelArraysMaterialized++;
+    return pixels;
+  });
 }
 
 async function ensureZstdPayload(key, entry) {
@@ -749,7 +1257,9 @@ async function ensureZstdPayload(key, entry) {
   }
 
   const rawRgb = getRawRgb(entry);
-  const compressed = zstdApi.compress(rawRgb, ZSTD_LEVEL);
+  const compressed = withSyncOperation("zstdCompressions", () =>
+    zstdApi.compress(rawRgb, ZSTD_LEVEL)
+  );
   entry.pixelsZstd = Buffer.from(compressed);
 
   saveDiskZstd(key, entry.pixelsZstd);
@@ -763,11 +1273,13 @@ async function ensureZstdPayload(key, entry) {
 }
 
 function sendV1Response(res, entry) {
-  stats.formatV1Responses++;
-  return res.json({
-    width: entry.width,
-    height: entry.height,
-    pixels: materializeV1Pixels(entry),
+  return withSyncOperation("v1Responses", () => {
+    stats.formatV1Responses++;
+    return res.json({
+      width: entry.width,
+      height: entry.height,
+      pixels: materializeV1Pixels(entry),
+    });
   });
 }
 
@@ -890,7 +1402,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     message: "Anime pixelize backend is running",
-    apiVersion: "2.3",
+    apiVersion: "2.4",
     pixelFormats: {
       default: 1,
       supported: hasZstd() ? [1, 2] : [1],
@@ -972,6 +1484,16 @@ app.get("/stats", (req, res) => {
     eventLoopDelay: {
       last60Seconds: lastEventLoopDelayWindow,
       currentWindow: readEventLoopDelay(),
+    },
+    memoryTelemetry: memoryTelemetrySnapshot(),
+    garbageCollection: garbageCollectionSnapshot(),
+    operations: {
+      active: operationSnapshot(),
+      lifetimePeak: {
+        ...operationTelemetry.lifetimePeak,
+        activePixelizeResponses: maxActivePixelizeResponses,
+        activeV2Streams: maxActiveV2Streams,
+      },
     },
     counters: { ...stats },
   });
@@ -1118,110 +1640,127 @@ app.post("/pixelize", async (req, res) => {
           return { entry: lateDisk, source: "disk" };
         }
 
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-        let imageResponse;
-
+        const generationOperation = `${selectedMem.kind}Generations`;
+        beginOperation(generationOperation);
         try {
-          imageResponse = await fetch(imageUrl, {
-            signal: controller.signal,
-            headers: {
-              "User-Agent": "AnimePixelizeBackend/2.3",
-            },
-          });
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+          let imageResponse;
+          let imageBuffer;
+
+          beginOperation("imageDownloads");
+          try {
+            imageResponse = await fetch(imageUrl, {
+              signal: controller.signal,
+              headers: {
+                "User-Agent": "AnimePixelizeBackend/2.4",
+              },
+            });
+
+            if (!imageResponse.ok) {
+              const error = new Error(
+                `Failed to download image: ${imageResponse.status}`
+              );
+              error.code = 400;
+              throw error;
+            }
+
+            const contentType = imageResponse.headers.get("content-type") || "";
+            if (!contentType.startsWith("image/")) {
+              const error = new Error("URL did not return an image");
+              error.code = 400;
+              throw error;
+            }
+
+            const contentLength = Number(
+              imageResponse.headers.get("content-length") || 0
+            );
+            if (contentLength > MAX_IMAGE_BYTES) {
+              stats.sizeBlocked++;
+              const error = new Error("Image too large");
+              error.code = 400;
+              throw error;
+            }
+
+            imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
+            if (imageBuffer.length > MAX_IMAGE_BYTES) {
+              stats.sizeBlocked++;
+              const error = new Error("Image too large");
+              error.code = 400;
+              throw error;
+            }
+          } finally {
+            clearTimeout(timeout);
+            endOperation("imageDownloads");
+          }
+
+          let raw;
+          beginOperation("sharpJobs");
+          try {
+            raw = await sharp(imageBuffer)
+              .resize(w, h, {
+                fit: resizeFit,
+                position: "center",
+                background: { r: 255, g: 255, b: 255, alpha: 1 },
+              })
+              .flatten({ background: { r: 255, g: 255, b: 255 } })
+              .removeAlpha()
+              .raw()
+              .toBuffer({ resolveWithObject: true });
+          } finally {
+            endOperation("sharpJobs");
+          }
+
+          // raw.data is already a Buffer; avoid a second full RGB allocation.
+          const rawRgb = raw.data;
+          const generatedEntry = {
+            width: raw.info.width,
+            height: raw.info.height,
+            pixelsGz: gzipRawRgb(rawRgb),
+            pixelsZstd: null,
+            pixels: null,
+            rawRgb,
+          };
+
+          validateRawLength(generatedEntry, rawRgb);
+
+          if (formatVersion === 2) {
+            generatedEntry.pixelsZstd = Buffer.from(
+              withSyncOperation("zstdCompressions", () =>
+                zstdApi.compress(rawRgb, ZSTD_LEVEL)
+              )
+            );
+            stats.zstdPayloadCompressions++;
+          }
+
+          const mode = isCanvas ? `${Number(colors)}colors` : "preview";
+
+          // Save the required gzip compatibility representation first.
+          saveDiskEntry(
+            key,
+            imageUrl,
+            generatedEntry.width,
+            generatedEntry.height,
+            resizeFit,
+            mode,
+            generatedEntry
+          );
+
+          // Once persisted, a v2 hot entry keeps only Zstd in memory.
+          if (formatVersion === 2 && db) {
+            generatedEntry.pixelsGz = null;
+            generatedEntry.rawRgb = null;
+            generatedEntry.pixels = null;
+          }
+
+          memCache.set(key, generatedEntry, cacheTtl);
+          stats.totalPixelsProcessed +=
+            generatedEntry.width * generatedEntry.height;
+
+          return { entry: generatedEntry, source: "generated" };
         } finally {
-          clearTimeout(timeout);
+          endOperation(generationOperation);
         }
-
-        if (!imageResponse.ok) {
-          const error = new Error(
-            `Failed to download image: ${imageResponse.status}`
-          );
-          error.code = 400;
-          throw error;
-        }
-
-        const contentType = imageResponse.headers.get("content-type") || "";
-        if (!contentType.startsWith("image/")) {
-          const error = new Error("URL did not return an image");
-          error.code = 400;
-          throw error;
-        }
-
-        const contentLength = Number(
-          imageResponse.headers.get("content-length") || 0
-        );
-        if (contentLength > MAX_IMAGE_BYTES) {
-          stats.sizeBlocked++;
-          const error = new Error("Image too large");
-          error.code = 400;
-          throw error;
-        }
-
-        const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-        if (imageBuffer.length > MAX_IMAGE_BYTES) {
-          stats.sizeBlocked++;
-          const error = new Error("Image too large");
-          error.code = 400;
-          throw error;
-        }
-
-        const raw = await sharp(imageBuffer)
-          .resize(w, h, {
-            fit: resizeFit,
-            position: "center",
-            background: { r: 255, g: 255, b: 255, alpha: 1 },
-          })
-          .flatten({ background: { r: 255, g: 255, b: 255 } })
-          .removeAlpha()
-          .raw()
-          .toBuffer({ resolveWithObject: true });
-
-        // raw.data is already a Buffer; avoid a second full RGB allocation.
-        const rawRgb = raw.data;
-        const generatedEntry = {
-          width: raw.info.width,
-          height: raw.info.height,
-          pixelsGz: gzipRawRgb(rawRgb),
-          pixelsZstd: null,
-          pixels: null,
-          rawRgb,
-        };
-
-        validateRawLength(generatedEntry, rawRgb);
-
-        if (formatVersion === 2) {
-          generatedEntry.pixelsZstd = Buffer.from(
-            zstdApi.compress(rawRgb, ZSTD_LEVEL)
-          );
-          stats.zstdPayloadCompressions++;
-        }
-
-        const mode = isCanvas ? `${Number(colors)}colors` : "preview";
-
-        // Save the required gzip compatibility representation first.
-        saveDiskEntry(
-          key,
-          imageUrl,
-          generatedEntry.width,
-          generatedEntry.height,
-          resizeFit,
-          mode,
-          generatedEntry
-        );
-
-        // Once persisted, a v2 hot entry keeps only Zstd in memory.
-        if (formatVersion === 2 && db) {
-          generatedEntry.pixelsGz = null;
-          generatedEntry.rawRgb = null;
-          generatedEntry.pixels = null;
-        }
-
-        memCache.set(key, generatedEntry, cacheTtl);
-        stats.totalPixelsProcessed +=
-          generatedEntry.width * generatedEntry.height;
-
-        return { entry: generatedEntry, source: "generated" };
       })
     );
 
@@ -1297,7 +1836,7 @@ async function startServer() {
   await initialiseZstd();
 
   httpServer = app.listen(PORT, () => {
-    console.log(`Pixelize backend v2.3 on :${PORT}`);
+    console.log(`Pixelize backend v2.4 on :${PORT}`);
     console.log(
       `  memCache preview=${MAX_PREVIEW_CACHE_ITEMS} ` +
         `canvas=${MAX_CANVAS_CACHE_ITEMS} ` +
@@ -1314,6 +1853,12 @@ async function startServer() {
     );
     console.log(
       `  rateLimit=${RATE_LIMIT_PER_MIN}/min MAX_DIM=${MAX_DIM}`
+    );
+    console.log(
+      `  memoryTelemetry rss=${MEMORY_RSS_SAMPLE_MS}ms ` +
+        `full=${MEMORY_FULL_SAMPLE_MS}ms ` +
+        `spikeHeap=${MEMORY_HEAP_SPIKE_MB}MB ` +
+        `spikeRss=${MEMORY_RSS_SPIKE_MB}MB`
     );
   });
 }
