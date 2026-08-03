@@ -1,6 +1,6 @@
 {
   "name": "anime-pixelize-backend",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "main": "pixelize-server.js",
   "scripts": {
     "start": "node pixelize-server.js",
@@ -10,10 +10,10 @@
   "dependencies": {
     "@bokuweb/zstd-wasm": "^0.0.27",
     "better-sqlite3": "^11.8.1",
-    "express": "^4.18.2",
-    "sharp": "^0.33.5"
+    "express": "^4.22.2",
+    "sharp": "^0.35.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.9.0"
   }
 }
