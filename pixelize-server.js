@@ -1,5 +1,5 @@
 // =====================================================================
-//  Paint Any Anime backend (v2.5 - MangaDex cover catalog + lower-memory image processing)
+//  Paint Any Anime backend (v2.5.1 - strict MangaDex matching + deduplicated volume covers)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -77,9 +77,9 @@ function hasZstd() {
 
 // ---------- CONFIG ----------
 const PORT = Number(process.env.PORT || 3000);
-const API_VERSION = "2.5";
+const API_VERSION = "2.5.1";
 const IMAGE_FETCH_USER_AGENT =
-  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.5";
+  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.5.1";
 
 
 // Legacy MAX_CACHE_ITEMS is retained only as a preview-cache fallback.
@@ -130,7 +130,7 @@ const MANGADEX_API_BASE = process.env.MANGADEX_API_BASE || "https://api.mangadex
 const MANGADEX_COVER_BASE =
   process.env.MANGADEX_COVER_BASE || "https://uploads.mangadex.org/covers";
 const MANGADEX_USER_AGENT =
-  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.5";
+  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.5.1";
 const MANGADEX_COVER_VARIANT = String(
   process.env.MANGADEX_COVER_VARIANT || "512"
 ).trim();
@@ -154,6 +154,21 @@ const CATALOG_CACHE_STALE_MS = Math.max(CATALOG_CACHE_TTL_MS, Number(
 ));
 const CATALOG_RATE_LIMIT_PER_MIN = Math.max(1, Number(
   process.env.CATALOG_RATE_LIMIT_PER_MIN || 120
+));
+const MANGADEX_MATCH_LIMIT = Math.max(10, Math.min(100, Number(
+  process.env.MANGADEX_MATCH_LIMIT || 50
+)));
+const MANGADEX_COVER_FETCH_LIMIT = Math.max(10, Math.min(100, Number(
+  process.env.MANGADEX_COVER_FETCH_LIMIT || 100
+)));
+const MANGADEX_COVER_MAX_RECORDS = Math.max(100, Number(
+  process.env.MANGADEX_COVER_MAX_RECORDS || 1000
+));
+const MANGADEX_PREFERRED_COVER_LOCALES = Array.from(new Set(
+  String(process.env.MANGADEX_PREFERRED_COVER_LOCALES || "ja,en")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
 ));
 
 // Memory telemetry is intentionally bounded and kept only in process memory.
@@ -891,6 +906,10 @@ const stats = {
   mangaDexRequests: 0,
   mangaDexFailures: 0,
   mangaDexResponseBytes: 0,
+  mangaDexAmbiguousMatches: 0,
+  mangaDexCoverRecordsFetched: 0,
+  mangaDexCoverDuplicatesRemoved: 0,
+  mangaDexCoverCatalogTruncated: 0,
 };
 
 // ---------- Peak memory, spike and garbage-collection telemetry ----------
@@ -1431,7 +1450,7 @@ function normaliseSearchText(value) {
   return String(value || "")
     .normalize("NFKD")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
 }
 
@@ -1452,32 +1471,138 @@ function firstLocalisedValue(value) {
   return value.en || value.ja || value[Object.keys(value)[0]] || null;
 }
 
-function mangaDexTitles(manga) {
-  const attributes = manga?.attributes || {};
+function localisedValues(value) {
+  if (!value || typeof value !== "object") return [];
+  return Array.from(new Set(
+    Object.values(value)
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+  ));
+}
+
+function mangaDexPrimaryTitles(manga) {
+  return localisedValues(manga?.attributes?.title);
+}
+
+function mangaDexAltTitles(manga) {
   const titles = [];
-  const primary = firstLocalisedValue(attributes.title);
-  if (primary) titles.push(primary);
-  for (const item of attributes.altTitles || []) {
-    const title = firstLocalisedValue(item);
-    if (title) titles.push(title);
+  for (const item of manga?.attributes?.altTitles || []) {
+    titles.push(...localisedValues(item));
   }
-  return titles;
+  return Array.from(new Set(titles));
+}
+
+function mangaDexTitles(manga) {
+  return Array.from(new Set([
+    ...mangaDexPrimaryTitles(manga),
+    ...mangaDexAltTitles(manga),
+  ]));
+}
+
+function mangaDexDisplayTitle(manga, fallback = null) {
+  const attributes = manga?.attributes || {};
+  return (
+    attributes.title?.en ||
+    attributes.title?.ja ||
+    firstLocalisedValue(attributes.title) ||
+    fallback ||
+    null
+  );
+}
+
+function mangaDexCandidateSummary(item) {
+  return {
+    mangaDexId: item?.id || null,
+    title: mangaDexDisplayTitle(item),
+    anilistId: item?.attributes?.links?.al || null,
+    originalLanguage: item?.attributes?.originalLanguage || null,
+  };
+}
+
+function catalogError(message, code, details = null) {
+  const error = new Error(message);
+  error.code = code;
+  if (details) error.details = details;
+  return error;
 }
 
 function pickMangaDexMatch(items, title, anilistId) {
-  const wantedId = anilistId == null ? null : String(anilistId);
+  const candidates = Array.isArray(items) ? items.filter(Boolean) : [];
+  const wantedId = anilistId == null ? null : String(anilistId).trim();
+  const wantedTitle = normaliseSearchText(title);
+
   if (wantedId) {
-    const linked = items.find(
-      (item) => String(item?.attributes?.links?.al || "") === wantedId
+    const linked = candidates.filter(
+      (item) => String(item?.attributes?.links?.al || "").trim() === wantedId
     );
-    if (linked) return linked;
+
+    if (linked.length === 1) {
+      return { item: linked[0], matchedBy: "anilist-id" };
+    }
+
+    if (linked.length > 1) {
+      const exactLinkedPrimary = linked.filter((item) =>
+        mangaDexPrimaryTitles(item).some(
+          (candidate) => normaliseSearchText(candidate) === wantedTitle
+        )
+      );
+      if (exactLinkedPrimary.length === 1) {
+        return { item: exactLinkedPrimary[0], matchedBy: "anilist-id+exact-primary-title" };
+      }
+
+      stats.mangaDexAmbiguousMatches++;
+      throw catalogError("MangaDex match is ambiguous for this AniList manga", 409, {
+        reason: "multiple-anilist-id-matches",
+        candidates: linked.slice(0, 10).map(mangaDexCandidateSummary),
+      });
+    }
   }
 
-  const wantedTitle = normaliseSearchText(title);
-  const exact = items.find((item) =>
-    mangaDexTitles(item).some((candidate) => normaliseSearchText(candidate) === wantedTitle)
-  );
-  return exact || items[0] || null;
+  if (wantedTitle) {
+    const exactPrimary = candidates.filter((item) =>
+      mangaDexPrimaryTitles(item).some(
+        (candidate) => normaliseSearchText(candidate) === wantedTitle
+      )
+    );
+
+    if (exactPrimary.length === 1) {
+      return {
+        item: exactPrimary[0],
+        matchedBy: wantedId ? "exact-primary-title-fallback" : "exact-primary-title",
+      };
+    }
+
+    if (exactPrimary.length > 1) {
+      stats.mangaDexAmbiguousMatches++;
+      throw catalogError("Multiple MangaDex series have the same primary title", 409, {
+        reason: "multiple-exact-primary-title-matches",
+        candidates: exactPrimary.slice(0, 10).map(mangaDexCandidateSummary),
+      });
+    }
+
+    const exactAlt = candidates.filter((item) =>
+      mangaDexAltTitles(item).some(
+        (candidate) => normaliseSearchText(candidate) === wantedTitle
+      )
+    );
+
+    if (exactAlt.length > 0) {
+      stats.mangaDexAmbiguousMatches++;
+      throw catalogError(
+        "Only alternate-title MangaDex matches were found; provide the AniList ID to select safely",
+        409,
+        {
+          reason: "alternate-title-only",
+          candidates: exactAlt.slice(0, 10).map(mangaDexCandidateSummary),
+        }
+      );
+    }
+  }
+
+  throw catalogError("No exact safe MangaDex match found", 404, {
+    reason: "no-exact-match",
+    candidates: candidates.slice(0, 5).map(mangaDexCandidateSummary),
+  });
 }
 
 function buildMangaDexCoverUrl(mangaId, fileName, variant = MANGADEX_COVER_VARIANT) {
@@ -1570,72 +1695,197 @@ async function resolveMangaDexManga({ title, anilistId, mangaDexId }) {
     return {
       id: mangaDexId,
       title: title || null,
+      originalLanguage: null,
       matchedBy: "provided-id",
     };
   }
 
-  const cacheKey = `mangadex:match:${anilistId || normaliseSearchText(title)}`;
+  const normalisedTitle = normaliseSearchText(title);
+  const cacheKey = `mangadex:match:${anilistId || "none"}:${normalisedTitle}`;
   const resolved = await cachedCatalogValue(cacheKey, async () => {
     const url = new URL("/manga", MANGADEX_API_BASE);
     url.searchParams.set("title", title);
-    url.searchParams.set("limit", "10");
+    url.searchParams.set("limit", String(MANGADEX_MATCH_LIMIT));
     url.searchParams.append("contentRating[]", "safe");
     url.searchParams.set("order[relevance]", "desc");
 
     const payload = await fetchJsonLimited(url.toString());
-    const selected = pickMangaDexMatch(payload?.data || [], title, anilistId);
-    if (!selected) {
-      return { notFound: true, title };
-    }
+    const match = pickMangaDexMatch(payload?.data || [], title, anilistId);
+    const selected = match.item;
 
     return {
       id: selected.id,
-      title: mangaDexTitles(selected)[0] || title,
-      matchedBy:
-        String(selected?.attributes?.links?.al || "") === String(anilistId || "")
-          ? "anilist-id"
-          : "title",
+      title: mangaDexDisplayTitle(selected, title),
+      originalLanguage: selected?.attributes?.originalLanguage || null,
+      matchedBy: match.matchedBy,
     };
   });
-
-  if (resolved.value.notFound) {
-    const error = new Error("No safe MangaDex match found");
-    error.code = 404;
-    throw error;
-  }
 
   return { ...resolved.value, stale: resolved.stale };
 }
 
-async function fetchMangaDexCoverPage({ mangaId, offset, limit }) {
-  const cacheKey = `mangadex:covers:${mangaId}:${offset}:${limit}`;
-  return cachedCatalogValue(cacheKey, async () => {
-    const url = new URL("/cover", MANGADEX_API_BASE);
-    url.searchParams.append("manga[]", mangaId);
-    url.searchParams.set("limit", String(limit));
-    url.searchParams.set("offset", String(offset));
-    url.searchParams.set("order[volume]", "asc");
+function normaliseVolumeLabel(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text || text.toLowerCase() === "none") return null;
+  const numeric = Number(text);
+  if (Number.isFinite(numeric)) return String(numeric);
+  return text;
+}
 
-    const payload = await fetchJsonLimited(url.toString());
-    const covers = (payload?.data || []).map((item) => {
-      const attributes = item?.attributes || {};
-      const fileName = String(attributes.fileName || "");
-      return {
-        id: item.id,
-        source: "mangadex",
-        type: "manga-volume",
-        volume: attributes.volume == null ? null : String(attributes.volume),
-        locale: attributes.locale || null,
-        imageUrl: buildMangaDexCoverUrl(mangaId, fileName),
-        originalImageUrl: buildMangaDexCoverUrl(mangaId, fileName, "original"),
-      };
+function localePreferenceOrder(originalLanguage) {
+  const values = [
+    String(originalLanguage || "").toLowerCase(),
+    ...MANGADEX_PREFERRED_COVER_LOCALES,
+    "ja",
+    "en",
+  ].filter(Boolean);
+  return Array.from(new Set(values));
+}
+
+function localeRank(locale, originalLanguage) {
+  const value = String(locale || "").toLowerCase();
+  const base = value.split("-")[0];
+  const preferences = localePreferenceOrder(originalLanguage);
+  for (let index = 0; index < preferences.length; index++) {
+    const preferred = preferences[index];
+    if (value === preferred) return index * 2;
+    if (base && base === preferred.split("-")[0]) return index * 2 + 1;
+  }
+  return 10_000;
+}
+
+function compareCoverChoice(a, b, originalLanguage) {
+  const localeDifference =
+    localeRank(a.locale, originalLanguage) - localeRank(b.locale, originalLanguage);
+  if (localeDifference !== 0) return localeDifference;
+
+  const versionDifference = Number(b.version || 0) - Number(a.version || 0);
+  if (versionDifference !== 0) return versionDifference;
+
+  const updatedDifference =
+    Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0);
+  if (Number.isFinite(updatedDifference) && updatedDifference !== 0) {
+    return updatedDifference;
+  }
+
+  return String(a.id || "").localeCompare(String(b.id || ""));
+}
+
+function compareVolumeLabels(a, b) {
+  const aNumber = Number(a.volume);
+  const bNumber = Number(b.volume);
+  const aNumeric = a.volume != null && Number.isFinite(aNumber);
+  const bNumeric = b.volume != null && Number.isFinite(bNumber);
+
+  if (aNumeric && bNumeric && aNumber !== bNumber) return aNumber - bNumber;
+  if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+  if (a.volume == null && b.volume != null) return 1;
+  if (a.volume != null && b.volume == null) return -1;
+  return String(a.volume || "").localeCompare(String(b.volume || ""), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function deduplicateMangaDexCovers(rawCovers, mangaId, originalLanguage) {
+  const groups = new Map();
+  for (const cover of rawCovers) {
+    const volume = normaliseVolumeLabel(cover.volume);
+    const key = volume == null ? "__unnumbered__" : `volume:${volume}`;
+    const current = groups.get(key) || [];
+    current.push({ ...cover, volume });
+    groups.set(key, current);
+  }
+
+  const covers = [];
+  for (const variants of groups.values()) {
+    variants.sort((a, b) => compareCoverChoice(a, b, originalLanguage));
+    const chosen = variants[0];
+    covers.push({
+      id: chosen.id,
+      source: "mangadex",
+      type: "manga-volume",
+      volume: chosen.volume,
+      locale: chosen.locale || null,
+      imageUrl: buildMangaDexCoverUrl(mangaId, chosen.fileName),
+      originalImageUrl: buildMangaDexCoverUrl(mangaId, chosen.fileName, "original"),
+      availableVariantCount: variants.length,
+      availableLocales: Array.from(new Set(
+        variants.map((item) => item.locale).filter(Boolean)
+      )),
     });
+  }
+
+  covers.sort(compareVolumeLabels);
+  return covers;
+}
+
+async function fetchMangaDexCoverCatalog({ mangaId, originalLanguage }) {
+  const localeKey = localePreferenceOrder(originalLanguage).join(",");
+  const cacheKey = `mangadex:covers:v2:${mangaId}:${localeKey}`;
+
+  return cachedCatalogValue(cacheKey, async () => {
+    const rawCovers = [];
+    let offset = 0;
+    let reportedTotal = null;
+    let truncated = false;
+
+    while (offset < MANGADEX_COVER_MAX_RECORDS) {
+      const limit = Math.min(
+        MANGADEX_COVER_FETCH_LIMIT,
+        MANGADEX_COVER_MAX_RECORDS - offset
+      );
+      const url = new URL("/cover", MANGADEX_API_BASE);
+      url.searchParams.append("manga[]", mangaId);
+      url.searchParams.set("limit", String(limit));
+      url.searchParams.set("offset", String(offset));
+      url.searchParams.set("order[volume]", "asc");
+
+      const payload = await fetchJsonLimited(url.toString());
+      const data = Array.isArray(payload?.data) ? payload.data : [];
+      reportedTotal = Number(payload?.total ?? data.length);
+
+      for (const item of data) {
+        const attributes = item?.attributes || {};
+        const fileName = String(attributes.fileName || "").trim();
+        if (!fileName || !item?.id) continue;
+        rawCovers.push({
+          id: item.id,
+          volume: attributes.volume == null ? null : String(attributes.volume),
+          locale: attributes.locale || null,
+          fileName,
+          version: Number(attributes.version || 0),
+          createdAt: attributes.createdAt || null,
+          updatedAt: attributes.updatedAt || null,
+        });
+      }
+
+      stats.mangaDexCoverRecordsFetched += data.length;
+      offset += data.length;
+      if (data.length === 0 || data.length < limit || offset >= reportedTotal) break;
+    }
+
+    if (reportedTotal != null && offset < reportedTotal) {
+      truncated = true;
+      stats.mangaDexCoverCatalogTruncated++;
+    }
+
+    const covers = deduplicateMangaDexCovers(
+      rawCovers,
+      mangaId,
+      originalLanguage
+    );
+    const duplicatesRemoved = Math.max(0, rawCovers.length - covers.length);
+    stats.mangaDexCoverDuplicatesRemoved += duplicatesRemoved;
 
     return {
       covers,
-      total: Number(payload?.total || covers.length),
-      limit: Number(payload?.limit || limit),
-      offset: Number(payload?.offset || offset),
+      total: covers.length,
+      rawTotal: reportedTotal ?? rawCovers.length,
+      fetchedRaw: rawCovers.length,
+      duplicatesRemoved,
+      truncated,
     };
   });
 }
@@ -2028,15 +2278,16 @@ app.get("/catalog/manga-covers", async (req, res) => {
     const page = boundedInteger(req.query.page, 1, 1, 10_000);
     const perPage = boundedInteger(req.query.perPage, 4, 1, 12);
     const includeMain = String(req.query.includeMain || "true") !== "false";
-    const hasMain = includeMain && (
-      Boolean(mainCoverUrl) || String(req.query.hasMain || "false") === "true"
-    );
+    const hasMain = includeMain && Boolean(mainCoverUrl);
 
     if (!mangaDexId && !title) {
       return res.status(400).json({ error: "title or mangaDexId is required" });
     }
     if (mangaDexId && !isUuid(mangaDexId)) {
       return res.status(400).json({ error: "mangaDexId must be a UUID" });
+    }
+    if (anilistId && !/^\d+$/.test(anilistId)) {
+      return res.status(400).json({ error: "anilistId must be numeric" });
     }
     if (mainCoverUrl && !isAllowedImageUrl(mainCoverUrl)) {
       return res.status(400).json({ error: "mainCoverUrl host is not allowed" });
@@ -2060,14 +2311,16 @@ app.get("/catalog/manga-covers", async (req, res) => {
 
     const coverOffset = Math.max(0, firstCombinedIndex - mainSlots);
     const coverLimit = Math.max(0, perPage - items.length);
-    let coverPage = { value: { covers: [], total: 0 }, stale: false };
+    const coverCatalog = await fetchMangaDexCoverCatalog({
+      mangaId: manga.id,
+      originalLanguage: manga.originalLanguage,
+    });
     if (coverLimit > 0) {
-      coverPage = await fetchMangaDexCoverPage({
-        mangaId: manga.id,
-        offset: coverOffset,
-        limit: coverLimit,
-      });
-      for (const cover of coverPage.value.covers) {
+      const visibleCovers = coverCatalog.value.covers.slice(
+        coverOffset,
+        coverOffset + coverLimit
+      );
+      for (const cover of visibleCovers) {
         const label = cover.volume ? `Vol. ${cover.volume}` : "Cover";
         items.push({
           ...cover,
@@ -2076,7 +2329,7 @@ app.get("/catalog/manga-covers", async (req, res) => {
       }
     }
 
-    const total = coverPage.value.total + (hasMain ? 1 : 0);
+    const total = coverCatalog.value.total + (hasMain ? 1 : 0);
     const totalPages = Math.max(1, Math.ceil(total / perPage));
 
     return res.json({
@@ -2092,9 +2345,17 @@ app.get("/catalog/manga-covers", async (req, res) => {
         anilistId,
         mangaDexId: manga.id,
         title: manga.title || mainTitle,
+        originalLanguage: manga.originalLanguage || null,
         matchedBy: manga.matchedBy,
       },
-      stale: Boolean(manga.stale || coverPage.stale),
+      coverCatalog: {
+        rawTotal: coverCatalog.value.rawTotal,
+        fetchedRaw: coverCatalog.value.fetchedRaw,
+        deduplicatedTotal: coverCatalog.value.total,
+        duplicatesRemoved: coverCatalog.value.duplicatesRemoved,
+        truncated: coverCatalog.value.truncated,
+      },
+      stale: Boolean(manga.stale || coverCatalog.stale),
       attribution: {
         mangaDex: "MangaDex",
         anilist: mainCoverUrl ? "AniList" : null,
@@ -2104,7 +2365,9 @@ app.get("/catalog/manga-covers", async (req, res) => {
     stats.catalogFailures++;
     const status = Number(error?.code || 500);
     if (status >= 400 && status < 600) {
-      return res.status(status).json({ error: String(error.message || error) });
+      const payload = { error: String(error.message || error) };
+      if (error?.details) payload.details = error.details;
+      return res.status(status).json(payload);
     }
     console.error("[catalog/manga-covers]", error);
     return res.status(500).json({ error: "catalog request failed" });
