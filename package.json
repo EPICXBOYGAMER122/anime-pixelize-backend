@@ -1,6 +1,6 @@
 {
   "name": "anime-pixelize-backend",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "main": "pixelize-server.js",
   "scripts": {
     "start": "node pixelize-server.js",
