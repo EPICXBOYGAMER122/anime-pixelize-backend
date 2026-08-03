@@ -1,5 +1,5 @@
 // =====================================================================
-//  Anime pixelize backend (v2.4 - streamed transport + memory telemetry)
+//  Paint Any Anime backend (v2.5 - MangaDex cover catalog + lower-memory image processing)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -77,6 +77,10 @@ function hasZstd() {
 
 // ---------- CONFIG ----------
 const PORT = Number(process.env.PORT || 3000);
+const API_VERSION = "2.5";
+const IMAGE_FETCH_USER_AGENT =
+  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.5";
+
 
 // Legacy MAX_CACHE_ITEMS is retained only as a preview-cache fallback.
 const LEGACY_MAX_CACHE_ITEMS = Number(process.env.MAX_CACHE_ITEMS || 0);
@@ -96,10 +100,61 @@ const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 30);
 const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN || 120);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 10_000);
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 5 * 1024 * 1024);
+const MAX_IMAGE_REDIRECTS = Math.max(0, Number(process.env.MAX_IMAGE_REDIRECTS || 3));
+const MAX_INPUT_PIXELS = Math.max(1, Number(process.env.MAX_INPUT_PIXELS || 40_000_000));
 const MAX_DIM = Number(process.env.MAX_DIM || 512);
 const MIN_DIM = Number(process.env.MIN_DIM || 8);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "cache.sqlite");
 
+// Bound libvips working memory. The pixel cache remains separate and is
+// already bounded by entry count. These defaults trade a small amount of
+// throughput for much lower RSS spikes on small Oracle instances.
+const SHARP_CACHE_MEMORY_MB = Math.max(0, Number(process.env.SHARP_CACHE_MEMORY_MB || 16));
+const SHARP_CACHE_FILES = Math.max(0, Number(process.env.SHARP_CACHE_FILES || 0));
+const SHARP_CACHE_ITEMS = Math.max(0, Number(process.env.SHARP_CACHE_ITEMS || 64));
+const SHARP_CONCURRENCY = Math.max(1, Number(process.env.SHARP_CONCURRENCY || 1));
+sharp.cache({
+  memory: SHARP_CACHE_MEMORY_MB,
+  files: SHARP_CACHE_FILES,
+  items: SHARP_CACHE_ITEMS,
+});
+sharp.concurrency(SHARP_CONCURRENCY);
+
+// MangaDex integration is deliberately disabled by default. Its current API
+// acceptable-use policy requires credit and disallows paid services/apps.
+// Enable only after confirming your Roblox experience is permitted to use it.
+const ENABLE_MANGADEX = /^(1|true|yes)$/i.test(
+  String(process.env.ENABLE_MANGADEX || "false")
+);
+const MANGADEX_API_BASE = process.env.MANGADEX_API_BASE || "https://api.mangadex.org";
+const MANGADEX_COVER_BASE =
+  process.env.MANGADEX_COVER_BASE || "https://uploads.mangadex.org/covers";
+const MANGADEX_USER_AGENT =
+  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.5";
+const MANGADEX_COVER_VARIANT = String(
+  process.env.MANGADEX_COVER_VARIANT || "512"
+).trim();
+const CATALOG_FETCH_TIMEOUT_MS = Math.max(1000, Number(
+  process.env.CATALOG_FETCH_TIMEOUT_MS || 8_000
+));
+const CATALOG_MAX_RESPONSE_BYTES = Math.max(16 * 1024, Number(
+  process.env.CATALOG_MAX_RESPONSE_BYTES || 1024 * 1024
+));
+const CATALOG_CACHE_MAX_ITEMS = Math.max(10, Number(
+  process.env.CATALOG_CACHE_MAX_ITEMS || 250
+));
+const CATALOG_CACHE_MAX_BYTES = Math.max(256 * 1024, Number(
+  process.env.CATALOG_CACHE_MAX_BYTES || 4 * 1024 * 1024
+));
+const CATALOG_CACHE_TTL_MS = Math.max(60_000, Number(
+  process.env.CATALOG_CACHE_TTL_MS || 6 * 60 * 60 * 1000
+));
+const CATALOG_CACHE_STALE_MS = Math.max(CATALOG_CACHE_TTL_MS, Number(
+  process.env.CATALOG_CACHE_STALE_MS || 24 * 60 * 60 * 1000
+));
+const CATALOG_RATE_LIMIT_PER_MIN = Math.max(1, Number(
+  process.env.CATALOG_RATE_LIMIT_PER_MIN || 120
+));
 
 // Memory telemetry is intentionally bounded and kept only in process memory.
 // RSS is sampled more frequently because it represents the complete resident
@@ -189,6 +244,7 @@ const DISK_CANVAS_MAX_AGE_MS = Number(
 const ALLOWED_HOSTS = new Set([
   "s4.anilist.co",
   "cdn.myanimelist.net",
+  "uploads.mangadex.org",
 ]);
 
 
@@ -205,6 +261,8 @@ const OPERATION_NAMES = [
   "previewGenerations",
   "canvasGenerations",
   "largeCanvasGenerations",
+  "catalogRequests",
+  "mangaDexRequests",
 ];
 
 const operationTelemetry = {
@@ -488,6 +546,79 @@ class LRU {
   }
 }
 
+class ByteBoundedLRU {
+  constructor(maxItems, maxBytes, ttlMs, staleMs) {
+    this.maxItems = maxItems;
+    this.maxBytes = maxBytes;
+    this.ttlMs = ttlMs;
+    this.staleMs = staleMs;
+    this.map = new Map();
+    this.bytes = 0;
+  }
+
+  _sizeOf(value) {
+    try {
+      return Buffer.byteLength(JSON.stringify(value), "utf8");
+    } catch {
+      return 0;
+    }
+  }
+
+  _remove(key) {
+    const entry = this.map.get(key);
+    if (!entry) return;
+    this.bytes = Math.max(0, this.bytes - entry.bytes);
+    this.map.delete(key);
+  }
+
+  get(key, allowStale = false) {
+    const entry = this.map.get(key);
+    if (!entry) return null;
+
+    const now = Date.now();
+    if (now > entry.staleUntil) {
+      this._remove(key);
+      return null;
+    }
+    if (!allowStale && now > entry.expiresAt) return null;
+
+    this.map.delete(key);
+    this.map.set(key, entry);
+    return { value: entry.value, stale: now > entry.expiresAt };
+  }
+
+  set(key, value) {
+    this._remove(key);
+    const bytes = this._sizeOf(value);
+    const now = Date.now();
+    this.map.set(key, {
+      value,
+      bytes,
+      expiresAt: now + this.ttlMs,
+      staleUntil: now + this.staleMs,
+    });
+    this.bytes += bytes;
+
+    while (this.map.size > this.maxItems || this.bytes > this.maxBytes) {
+      const oldest = this.map.keys().next().value;
+      if (oldest == null) break;
+      this._remove(oldest);
+    }
+  }
+
+  size() {
+    return this.map.size;
+  }
+}
+
+const catalogCache = new ByteBoundedLRU(
+  CATALOG_CACHE_MAX_ITEMS,
+  CATALOG_CACHE_MAX_BYTES,
+  CATALOG_CACHE_TTL_MS,
+  CATALOG_CACHE_STALE_MS
+);
+const catalogInflight = new Map();
+
 const previewMemCache = new LRU(MAX_PREVIEW_CACHE_ITEMS, TTL_PREVIEW_MS);
 const canvasMemCache = new LRU(MAX_CANVAS_CACHE_ITEMS, TTL_CANVAS_MS);
 const largeCanvasMemCache = new LRU(
@@ -574,32 +705,43 @@ async function withSlot(fn) {
 
 // ---------- Rate limit ----------
 const buckets = new Map();
+const catalogBuckets = new Map();
 
-function rateLimit(ip) {
+function consumeRateToken(bucketMap, ip, perMinute) {
   const now = Date.now();
-  const bucket = buckets.get(ip) || {
-    tokens: RATE_LIMIT_PER_MIN,
+  const bucket = bucketMap.get(ip) || {
+    tokens: perMinute,
     updatedAt: now,
   };
 
-  const refill = ((now - bucket.updatedAt) / 60_000) * RATE_LIMIT_PER_MIN;
-  bucket.tokens = Math.min(RATE_LIMIT_PER_MIN, bucket.tokens + refill);
+  const refill = ((now - bucket.updatedAt) / 60_000) * perMinute;
+  bucket.tokens = Math.min(perMinute, bucket.tokens + refill);
   bucket.updatedAt = now;
 
   if (bucket.tokens < 1) {
-    buckets.set(ip, bucket);
+    bucketMap.set(ip, bucket);
     return false;
   }
 
   bucket.tokens -= 1;
-  buckets.set(ip, bucket);
+  bucketMap.set(ip, bucket);
   return true;
+}
+
+function rateLimit(ip) {
+  return consumeRateToken(buckets, ip, RATE_LIMIT_PER_MIN);
+}
+
+function catalogRateLimit(ip) {
+  return consumeRateToken(catalogBuckets, ip, CATALOG_RATE_LIMIT_PER_MIN);
 }
 
 setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
-  for (const [ip, bucket] of buckets) {
-    if (bucket.updatedAt < cutoff) buckets.delete(ip);
+  for (const bucketMap of [buckets, catalogBuckets]) {
+    for (const [ip, bucket] of bucketMap) {
+      if (bucket.updatedAt < cutoff) bucketMap.delete(ip);
+    }
   }
 }, 5 * 60 * 1000).unref();
 
@@ -738,6 +880,17 @@ const stats = {
   diskTouchBatches: 0,
   diskRowsTouched: 0,
   diskTouchFailures: 0,
+
+  catalogRequests: 0,
+  catalogRateLimited: 0,
+  catalogCacheHits: 0,
+  catalogCacheMisses: 0,
+  catalogStaleFallbacks: 0,
+  catalogInflightDedupes: 0,
+  catalogFailures: 0,
+  mangaDexRequests: 0,
+  mangaDexFailures: 0,
+  mangaDexResponseBytes: 0,
 };
 
 // ---------- Peak memory, spike and garbage-collection telemetry ----------
@@ -1157,10 +1310,334 @@ if (db) {
 function isAllowedImageUrl(imageUrl) {
   try {
     const url = new URL(imageUrl);
-    return url.protocol === "https:" && ALLOWED_HOSTS.has(url.hostname);
+    if (url.protocol !== "https:" || !ALLOWED_HOSTS.has(url.hostname)) {
+      return false;
+    }
+
+    if (url.hostname === "uploads.mangadex.org") {
+      return /^\/covers\/[0-9a-f-]{36}\//i.test(url.pathname);
+    }
+
+    return true;
   } catch {
     return false;
   }
+}
+
+function originalMangaDexCoverUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.hostname !== "uploads.mangadex.org") return null;
+    const match = url.pathname.match(/^(\/covers\/[0-9a-f-]{36}\/[^/]+)\.(256|512)\.jpg$/i);
+    if (!match) return null;
+    url.pathname = match[1];
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function fetchAllowedImageResponse(imageUrl, signal) {
+  let currentUrl = imageUrl;
+  let thumbnailFallback = originalMangaDexCoverUrl(currentUrl);
+
+  for (let redirectCount = 0; redirectCount <= MAX_IMAGE_REDIRECTS; redirectCount++) {
+    if (!isAllowedImageUrl(currentUrl)) {
+      const error = new Error("Image redirect host is not allowed");
+      error.code = 400;
+      throw error;
+    }
+
+    const response = await fetch(currentUrl, {
+      signal,
+      redirect: "manual",
+      headers: { "User-Agent": IMAGE_FETCH_USER_AGENT },
+    });
+
+    if (response.status === 404 && thumbnailFallback) {
+      try { await response.body?.cancel(); } catch {}
+      currentUrl = thumbnailFallback;
+      thumbnailFallback = null;
+      continue;
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location || redirectCount >= MAX_IMAGE_REDIRECTS) {
+        const error = new Error("Too many or invalid image redirects");
+        error.code = 400;
+        throw error;
+      }
+      try { await response.body?.cancel(); } catch {}
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+
+    return response;
+  }
+
+  const error = new Error("Too many image redirects");
+  error.code = 400;
+  throw error;
+}
+
+async function readResponseBodyLimited(response, maxBytes, sizeCounter) {
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (declaredLength > maxBytes) {
+    if (sizeCounter) sizeCounter();
+    const error = new Error("Response too large");
+    error.code = 400;
+    throw error;
+  }
+
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > maxBytes) {
+      if (sizeCounter) sizeCounter();
+      const error = new Error("Response too large");
+      error.code = 400;
+      throw error;
+    }
+    return buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (total > maxBytes) {
+        if (sizeCounter) sizeCounter();
+        await reader.cancel("response too large");
+        const error = new Error("Response too large");
+        error.code = 400;
+        throw error;
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks, total);
+}
+
+function normaliseSearchText(value) {
+  return String(value || "")
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  const safe = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.max(minimum, Math.min(maximum, safe));
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || "")
+  );
+}
+
+function firstLocalisedValue(value) {
+  if (!value || typeof value !== "object") return null;
+  return value.en || value.ja || value[Object.keys(value)[0]] || null;
+}
+
+function mangaDexTitles(manga) {
+  const attributes = manga?.attributes || {};
+  const titles = [];
+  const primary = firstLocalisedValue(attributes.title);
+  if (primary) titles.push(primary);
+  for (const item of attributes.altTitles || []) {
+    const title = firstLocalisedValue(item);
+    if (title) titles.push(title);
+  }
+  return titles;
+}
+
+function pickMangaDexMatch(items, title, anilistId) {
+  const wantedId = anilistId == null ? null : String(anilistId);
+  if (wantedId) {
+    const linked = items.find(
+      (item) => String(item?.attributes?.links?.al || "") === wantedId
+    );
+    if (linked) return linked;
+  }
+
+  const wantedTitle = normaliseSearchText(title);
+  const exact = items.find((item) =>
+    mangaDexTitles(item).some((candidate) => normaliseSearchText(candidate) === wantedTitle)
+  );
+  return exact || items[0] || null;
+}
+
+function buildMangaDexCoverUrl(mangaId, fileName, variant = MANGADEX_COVER_VARIANT) {
+  const safeFileName = encodeURIComponent(String(fileName || ""));
+  const base = `${MANGADEX_COVER_BASE}/${mangaId}/${safeFileName}`;
+  if (!variant || variant === "original") return base;
+  return `${base}.${variant}.jpg`;
+}
+
+async function fetchJsonLimited(url, headers = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CATALOG_FETCH_TIMEOUT_MS);
+  beginOperation("mangaDexRequests");
+  stats.mangaDexRequests++;
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        "User-Agent": MANGADEX_USER_AGENT,
+        ...headers,
+      },
+    });
+
+    if (!response.ok) {
+      const error = new Error(`MangaDex request failed: ${response.status}`);
+      error.code = response.status >= 500 ? 503 : 400;
+      throw error;
+    }
+
+    const buffer = await readResponseBodyLimited(
+      response,
+      CATALOG_MAX_RESPONSE_BYTES,
+      null
+    );
+    stats.mangaDexResponseBytes += buffer.length;
+    return JSON.parse(buffer.toString("utf8"));
+  } catch (error) {
+    stats.mangaDexFailures++;
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error("MangaDex request timed out");
+      timeoutError.code = 503;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    endOperation("mangaDexRequests");
+  }
+}
+
+async function cachedCatalogValue(key, loader) {
+  const fresh = catalogCache.get(key, false);
+  if (fresh) {
+    stats.catalogCacheHits++;
+    return { value: fresh.value, stale: false };
+  }
+
+  stats.catalogCacheMisses++;
+  const existing = catalogInflight.get(key);
+  if (existing) {
+    stats.catalogInflightDedupes++;
+    return existing;
+  }
+
+  const promise = (async () => {
+    try {
+      const value = await loader();
+      catalogCache.set(key, value);
+      return { value, stale: false };
+    } catch (error) {
+      const stale = catalogCache.get(key, true);
+      if (stale) {
+        stats.catalogStaleFallbacks++;
+        return { value: stale.value, stale: true };
+      }
+      throw error;
+    } finally {
+      catalogInflight.delete(key);
+    }
+  })();
+
+  catalogInflight.set(key, promise);
+  return promise;
+}
+
+async function resolveMangaDexManga({ title, anilistId, mangaDexId }) {
+  if (mangaDexId) {
+    return {
+      id: mangaDexId,
+      title: title || null,
+      matchedBy: "provided-id",
+    };
+  }
+
+  const cacheKey = `mangadex:match:${anilistId || normaliseSearchText(title)}`;
+  const resolved = await cachedCatalogValue(cacheKey, async () => {
+    const url = new URL("/manga", MANGADEX_API_BASE);
+    url.searchParams.set("title", title);
+    url.searchParams.set("limit", "10");
+    url.searchParams.append("contentRating[]", "safe");
+    url.searchParams.set("order[relevance]", "desc");
+
+    const payload = await fetchJsonLimited(url.toString());
+    const selected = pickMangaDexMatch(payload?.data || [], title, anilistId);
+    if (!selected) {
+      return { notFound: true, title };
+    }
+
+    return {
+      id: selected.id,
+      title: mangaDexTitles(selected)[0] || title,
+      matchedBy:
+        String(selected?.attributes?.links?.al || "") === String(anilistId || "")
+          ? "anilist-id"
+          : "title",
+    };
+  });
+
+  if (resolved.value.notFound) {
+    const error = new Error("No safe MangaDex match found");
+    error.code = 404;
+    throw error;
+  }
+
+  return { ...resolved.value, stale: resolved.stale };
+}
+
+async function fetchMangaDexCoverPage({ mangaId, offset, limit }) {
+  const cacheKey = `mangadex:covers:${mangaId}:${offset}:${limit}`;
+  return cachedCatalogValue(cacheKey, async () => {
+    const url = new URL("/cover", MANGADEX_API_BASE);
+    url.searchParams.append("manga[]", mangaId);
+    url.searchParams.set("limit", String(limit));
+    url.searchParams.set("offset", String(offset));
+    url.searchParams.set("order[volume]", "asc");
+
+    const payload = await fetchJsonLimited(url.toString());
+    const covers = (payload?.data || []).map((item) => {
+      const attributes = item?.attributes || {};
+      const fileName = String(attributes.fileName || "");
+      return {
+        id: item.id,
+        source: "mangadex",
+        type: "manga-volume",
+        volume: attributes.volume == null ? null : String(attributes.volume),
+        locale: attributes.locale || null,
+        imageUrl: buildMangaDexCoverUrl(mangaId, fileName),
+        originalImageUrl: buildMangaDexCoverUrl(mangaId, fileName, "original"),
+      };
+    });
+
+    return {
+      covers,
+      total: Number(payload?.total || covers.length),
+      limit: Number(payload?.limit || limit),
+      offset: Number(payload?.offset || offset),
+    };
+  });
 }
 
 function cacheKeyFor({ imageUrl, w, h, fit, colors }) {
@@ -1401,12 +1878,16 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
-    message: "Anime pixelize backend is running",
-    apiVersion: "2.4",
+    message: "Paint Any Anime backend is running",
+    apiVersion: API_VERSION,
     pixelFormats: {
       default: 1,
       supported: hasZstd() ? [1, 2] : [1],
       format2Available: hasZstd(),
+    },
+    catalog: {
+      mangaDexEnabled: ENABLE_MANGADEX,
+      endpoint: "/catalog/manga-covers",
     },
   });
 });
@@ -1415,6 +1896,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     format2Available: hasZstd(),
+    mangaDexEnabled: ENABLE_MANGADEX,
   });
 });
 
@@ -1467,6 +1949,26 @@ app.get("/stats", (req, res) => {
     rateLimit: {
       perMinute: RATE_LIMIT_PER_MIN,
       bucketsTracked: buckets.size,
+      catalogPerMinute: CATALOG_RATE_LIMIT_PER_MIN,
+      catalogBucketsTracked: catalogBuckets.size,
+    },
+    sharp: {
+      cache: sharp.cache(),
+      concurrency: sharp.concurrency(),
+      counters: sharp.counters(),
+      maxInputPixels: MAX_INPUT_PIXELS,
+    },
+    catalog: {
+      mangaDexEnabled: ENABLE_MANGADEX,
+      cacheItems: catalogCache.size(),
+      cacheBytes: catalogCache.bytes,
+      cacheLimits: {
+        items: CATALOG_CACHE_MAX_ITEMS,
+        bytes: CATALOG_CACHE_MAX_BYTES,
+        ttlMs: CATALOG_CACHE_TTL_MS,
+        staleMs: CATALOG_CACHE_STALE_MS,
+      },
+      inFlight: catalogInflight.size,
     },
     pendingDiskTouches: pendingDiskTouches.size,
     httpResponses: {
@@ -1497,6 +1999,118 @@ app.get("/stats", (req, res) => {
     },
     counters: { ...stats },
   });
+});
+
+app.get("/catalog/manga-covers", async (req, res) => {
+  const ip = req.ip || req.connection?.remoteAddress || "unknown";
+  if (!catalogRateLimit(ip)) {
+    stats.catalogRateLimited++;
+    return res.status(429).json({ error: "catalog rate limited" });
+  }
+
+  stats.catalogRequests++;
+  beginOperation("catalogRequests");
+
+  try {
+    if (!ENABLE_MANGADEX) {
+      return res.status(503).json({
+        error: "MangaDex integration is disabled",
+        reason:
+          "Enable only after confirming compliance with MangaDex acceptable-use terms.",
+      });
+    }
+
+    const title = String(req.query.title || "").trim().slice(0, 160);
+    const anilistId = String(req.query.anilistId || "").trim() || null;
+    const mangaDexId = String(req.query.mangaDexId || "").trim() || null;
+    const mainCoverUrl = String(req.query.mainCoverUrl || "").trim() || null;
+    const mainTitle = String(req.query.mainTitle || title || "Manga").trim().slice(0, 160);
+    const page = boundedInteger(req.query.page, 1, 1, 10_000);
+    const perPage = boundedInteger(req.query.perPage, 4, 1, 12);
+    const includeMain = String(req.query.includeMain || "true") !== "false";
+    const hasMain = includeMain && (
+      Boolean(mainCoverUrl) || String(req.query.hasMain || "false") === "true"
+    );
+
+    if (!mangaDexId && !title) {
+      return res.status(400).json({ error: "title or mangaDexId is required" });
+    }
+    if (mangaDexId && !isUuid(mangaDexId)) {
+      return res.status(400).json({ error: "mangaDexId must be a UUID" });
+    }
+    if (mainCoverUrl && !isAllowedImageUrl(mainCoverUrl)) {
+      return res.status(400).json({ error: "mainCoverUrl host is not allowed" });
+    }
+
+    const manga = await resolveMangaDexManga({ title, anilistId, mangaDexId });
+    const mainSlots = hasMain ? 1 : 0;
+    const firstCombinedIndex = (page - 1) * perPage;
+    const items = [];
+
+    if (hasMain && firstCombinedIndex === 0 && mainCoverUrl) {
+      items.push({
+        id: anilistId ? `anilist:${anilistId}` : `anilist:${normaliseSearchText(mainTitle)}`,
+        source: "anilist",
+        type: "manga-main",
+        title: `${mainTitle} — Main Cover`,
+        volume: null,
+        imageUrl: mainCoverUrl,
+      });
+    }
+
+    const coverOffset = Math.max(0, firstCombinedIndex - mainSlots);
+    const coverLimit = Math.max(0, perPage - items.length);
+    let coverPage = { value: { covers: [], total: 0 }, stale: false };
+    if (coverLimit > 0) {
+      coverPage = await fetchMangaDexCoverPage({
+        mangaId: manga.id,
+        offset: coverOffset,
+        limit: coverLimit,
+      });
+      for (const cover of coverPage.value.covers) {
+        const label = cover.volume ? `Vol. ${cover.volume}` : "Cover";
+        items.push({
+          ...cover,
+          title: `${mainTitle || manga.title || "Manga"} — ${label}`,
+        });
+      }
+    }
+
+    const total = coverPage.value.total + (hasMain ? 1 : 0);
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+
+    return res.json({
+      mode: "manga",
+      page,
+      perPage,
+      total,
+      totalPages,
+      hasNextPage: page < totalPages,
+      hasMain,
+      items,
+      manga: {
+        anilistId,
+        mangaDexId: manga.id,
+        title: manga.title || mainTitle,
+        matchedBy: manga.matchedBy,
+      },
+      stale: Boolean(manga.stale || coverPage.stale),
+      attribution: {
+        mangaDex: "MangaDex",
+        anilist: mainCoverUrl ? "AniList" : null,
+      },
+    });
+  } catch (error) {
+    stats.catalogFailures++;
+    const status = Number(error?.code || 500);
+    if (status >= 400 && status < 600) {
+      return res.status(status).json({ error: String(error.message || error) });
+    }
+    console.error("[catalog/manga-covers]", error);
+    return res.status(500).json({ error: "catalog request failed" });
+  } finally {
+    endOperation("catalogRequests");
+  }
 });
 
 app.post("/pixelize", async (req, res) => {
@@ -1650,12 +2264,7 @@ app.post("/pixelize", async (req, res) => {
 
           beginOperation("imageDownloads");
           try {
-            imageResponse = await fetch(imageUrl, {
-              signal: controller.signal,
-              headers: {
-                "User-Agent": "AnimePixelizeBackend/2.4",
-              },
-            });
+            imageResponse = await fetchAllowedImageResponse(imageUrl, controller.signal);
 
             if (!imageResponse.ok) {
               const error = new Error(
@@ -1682,13 +2291,11 @@ app.post("/pixelize", async (req, res) => {
               throw error;
             }
 
-            imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-            if (imageBuffer.length > MAX_IMAGE_BYTES) {
-              stats.sizeBlocked++;
-              const error = new Error("Image too large");
-              error.code = 400;
-              throw error;
-            }
+            imageBuffer = await readResponseBodyLimited(
+              imageResponse,
+              MAX_IMAGE_BYTES,
+              () => { stats.sizeBlocked++; }
+            );
           } finally {
             clearTimeout(timeout);
             endOperation("imageDownloads");
@@ -1697,7 +2304,12 @@ app.post("/pixelize", async (req, res) => {
           let raw;
           beginOperation("sharpJobs");
           try {
-            raw = await sharp(imageBuffer)
+            raw = await sharp(imageBuffer, {
+              limitInputPixels: MAX_INPUT_PIXELS,
+              limitInputChannels: 4,
+              sequentialRead: true,
+              pages: 1,
+            })
               .resize(w, h, {
                 fit: resizeFit,
                 position: "center",
@@ -1710,6 +2322,7 @@ app.post("/pixelize", async (req, res) => {
           } finally {
             endOperation("sharpJobs");
           }
+          imageBuffer = null;
 
           // raw.data is already a Buffer; avoid a second full RGB allocation.
           const rawRgb = raw.data;
@@ -1746,11 +2359,12 @@ app.post("/pixelize", async (req, res) => {
             generatedEntry
           );
 
-          // Once persisted, a v2 hot entry keeps only Zstd in memory.
+          // Never retain uncompressed RGB in the long-lived LRU. For v2 with
+          // SQLite, keep only Zstd; for v1 keep only the compact gzip payload.
+          generatedEntry.rawRgb = null;
+          generatedEntry.pixels = null;
           if (formatVersion === 2 && db) {
             generatedEntry.pixelsGz = null;
-            generatedEntry.rawRgb = null;
-            generatedEntry.pixels = null;
           }
 
           memCache.set(key, generatedEntry, cacheTtl);
@@ -1836,7 +2450,7 @@ async function startServer() {
   await initialiseZstd();
 
   httpServer = app.listen(PORT, () => {
-    console.log(`Pixelize backend v2.4 on :${PORT}`);
+    console.log(`Pixelize backend v${API_VERSION} on :${PORT}`);
     console.log(
       `  memCache preview=${MAX_PREVIEW_CACHE_ITEMS} ` +
         `canvas=${MAX_CANVAS_CACHE_ITEMS} ` +
@@ -1852,7 +2466,16 @@ async function startServer() {
       `  concurrency max=${MAX_CONCURRENT_PIXELIZE} queue max=${MAX_QUEUE_SIZE}`
     );
     console.log(
-      `  rateLimit=${RATE_LIMIT_PER_MIN}/min MAX_DIM=${MAX_DIM}`
+      `  rateLimit=${RATE_LIMIT_PER_MIN}/min catalogRate=${CATALOG_RATE_LIMIT_PER_MIN}/min ` +
+        `MAX_DIM=${MAX_DIM} MAX_INPUT_PIXELS=${MAX_INPUT_PIXELS}`
+    );
+    console.log(
+      `  sharp cache=${SHARP_CACHE_MEMORY_MB}MB/${SHARP_CACHE_ITEMS} items ` +
+        `concurrency=${SHARP_CONCURRENCY}`
+    );
+    console.log(
+      `  MangaDex=${ENABLE_MANGADEX ? "enabled" : "disabled"} ` +
+        `catalogCache=${CATALOG_CACHE_MAX_ITEMS} items/${Math.round(CATALOG_CACHE_MAX_BYTES / 1024 / 1024)}MB`
     );
     console.log(
       `  memoryTelemetry rss=${MEMORY_RSS_SAMPLE_MS}ms ` +
