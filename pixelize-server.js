@@ -1,5 +1,5 @@
 // =====================================================================
-//  Paint Any Anime backend (v2.5.1 - strict MangaDex matching + deduplicated volume covers)
+//  Paint Any Anime backend (v2.5.2 - safe-first MangaDex matching + exact AniList suggestive fallback)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -77,9 +77,9 @@ function hasZstd() {
 
 // ---------- CONFIG ----------
 const PORT = Number(process.env.PORT || 3000);
-const API_VERSION = "2.5.1";
+const API_VERSION = "2.5.2";
 const IMAGE_FETCH_USER_AGENT =
-  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.5.1";
+  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.5.2";
 
 
 // Legacy MAX_CACHE_ITEMS is retained only as a preview-cache fallback.
@@ -130,7 +130,7 @@ const MANGADEX_API_BASE = process.env.MANGADEX_API_BASE || "https://api.mangadex
 const MANGADEX_COVER_BASE =
   process.env.MANGADEX_COVER_BASE || "https://uploads.mangadex.org/covers";
 const MANGADEX_USER_AGENT =
-  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.5.1";
+  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.5.2";
 const MANGADEX_COVER_VARIANT = String(
   process.env.MANGADEX_COVER_VARIANT || "512"
 ).trim();
@@ -158,6 +158,10 @@ const CATALOG_RATE_LIMIT_PER_MIN = Math.max(1, Number(
 const MANGADEX_MATCH_LIMIT = Math.max(10, Math.min(100, Number(
   process.env.MANGADEX_MATCH_LIMIT || 50
 )));
+const MANGADEX_MATCH_SCAN_MAX = Math.max(
+  MANGADEX_MATCH_LIMIT,
+  Math.min(100, Number(process.env.MANGADEX_MATCH_SCAN_MAX || 100))
+);
 const MANGADEX_COVER_FETCH_LIMIT = Math.max(10, Math.min(100, Number(
   process.env.MANGADEX_COVER_FETCH_LIMIT || 100
 )));
@@ -910,6 +914,8 @@ const stats = {
   mangaDexCoverRecordsFetched: 0,
   mangaDexCoverDuplicatesRemoved: 0,
   mangaDexCoverCatalogTruncated: 0,
+  mangaDexSuggestiveFallbackRequests: 0,
+  mangaDexSuggestiveFallbackMatches: 0,
 };
 
 // ---------- Peak memory, spike and garbage-collection telemetry ----------
@@ -1516,6 +1522,7 @@ function mangaDexCandidateSummary(item) {
     title: mangaDexDisplayTitle(item),
     anilistId: item?.attributes?.links?.al || null,
     originalLanguage: item?.attributes?.originalLanguage || null,
+    contentRating: item?.attributes?.contentRating || null,
   };
 }
 
@@ -1526,7 +1533,17 @@ function catalogError(message, code, details = null) {
   return error;
 }
 
-function pickMangaDexMatch(items, title, anilistId) {
+function pickMangaDexMatch(
+  items,
+  title,
+  anilistId,
+  {
+    allowTitleFallback = true,
+    noMatchMessage = "No exact safe MangaDex match found",
+    noMatchReason = "no-exact-match",
+    matchedBySuffix = "",
+  } = {}
+) {
   const candidates = Array.isArray(items) ? items.filter(Boolean) : [];
   const wantedId = anilistId == null ? null : String(anilistId).trim();
   const wantedTitle = normaliseSearchText(title);
@@ -1537,7 +1554,10 @@ function pickMangaDexMatch(items, title, anilistId) {
     );
 
     if (linked.length === 1) {
-      return { item: linked[0], matchedBy: "anilist-id" };
+      return {
+        item: linked[0],
+        matchedBy: `anilist-id${matchedBySuffix}`,
+      };
     }
 
     if (linked.length > 1) {
@@ -1547,7 +1567,10 @@ function pickMangaDexMatch(items, title, anilistId) {
         )
       );
       if (exactLinkedPrimary.length === 1) {
-        return { item: exactLinkedPrimary[0], matchedBy: "anilist-id+exact-primary-title" };
+        return {
+          item: exactLinkedPrimary[0],
+          matchedBy: `anilist-id+exact-primary-title${matchedBySuffix}`,
+        };
       }
 
       stats.mangaDexAmbiguousMatches++;
@@ -1556,9 +1579,20 @@ function pickMangaDexMatch(items, title, anilistId) {
         candidates: linked.slice(0, 10).map(mangaDexCandidateSummary),
       });
     }
+
+    // With an AniList ID, never silently select a similarly titled series.
+    // The resolver may retry safe+suggestive, but that retry still requires
+    // the exact MangaDex links.al value to match this ID.
+    if (!allowTitleFallback) {
+      throw catalogError(noMatchMessage, 404, {
+        reason: noMatchReason,
+        requestedAniListId: wantedId,
+        candidates: candidates.slice(0, 5).map(mangaDexCandidateSummary),
+      });
+    }
   }
 
-  if (wantedTitle) {
+  if (wantedTitle && allowTitleFallback) {
     const exactPrimary = candidates.filter((item) =>
       mangaDexPrimaryTitles(item).some(
         (candidate) => normaliseSearchText(candidate) === wantedTitle
@@ -1599,8 +1633,8 @@ function pickMangaDexMatch(items, title, anilistId) {
     }
   }
 
-  throw catalogError("No exact safe MangaDex match found", 404, {
-    reason: "no-exact-match",
+  throw catalogError(noMatchMessage, 404, {
+    reason: noMatchReason,
     candidates: candidates.slice(0, 5).map(mangaDexCandidateSummary),
   });
 }
@@ -1696,27 +1730,124 @@ async function resolveMangaDexManga({ title, anilistId, mangaDexId }) {
       id: mangaDexId,
       title: title || null,
       originalLanguage: null,
+      contentRating: null,
       matchedBy: "provided-id",
     };
   }
 
   const normalisedTitle = normaliseSearchText(title);
-  const cacheKey = `mangadex:match:${anilistId || "none"}:${normalisedTitle}`;
+  const cacheKey = `mangadex:match:v2:${anilistId || "none"}:${normalisedTitle}`;
   const resolved = await cachedCatalogValue(cacheKey, async () => {
-    const url = new URL("/manga", MANGADEX_API_BASE);
-    url.searchParams.set("title", title);
-    url.searchParams.set("limit", String(MANGADEX_MATCH_LIMIT));
-    url.searchParams.append("contentRating[]", "safe");
-    url.searchParams.set("order[relevance]", "desc");
+    const buildSearchUrl = (
+      ratings,
+      offset = 0,
+      limit = MANGADEX_MATCH_LIMIT
+    ) => {
+      const url = new URL("/manga", MANGADEX_API_BASE);
+      url.searchParams.set("title", title);
+      url.searchParams.set("limit", String(limit));
+      url.searchParams.set("offset", String(offset));
+      for (const rating of ratings) {
+        url.searchParams.append("contentRating[]", rating);
+      }
+      url.searchParams.set("order[relevance]", "desc");
+      return url;
+    };
 
-    const payload = await fetchJsonLimited(url.toString());
-    const match = pickMangaDexMatch(payload?.data || [], title, anilistId);
+    // Pass 1: safe-only. Title-only requests can match only an exact primary
+    // title in this safe result set.
+    const safePayload = await fetchJsonLimited(
+      buildSearchUrl(["safe"]).toString()
+    );
+
+    let match;
+    if (anilistId) {
+      try {
+        match = pickMangaDexMatch(
+          safePayload?.data || [],
+          title,
+          anilistId,
+          {
+            allowTitleFallback: false,
+            noMatchMessage: "No exact safe MangaDex AniList match found",
+            noMatchReason: "no-safe-anilist-id-match",
+          }
+        );
+      } catch (error) {
+        if (error?.code !== 404 || error?.details?.reason !== "no-safe-anilist-id-match") {
+          throw error;
+        }
+
+        // Pass 2: safe+suggestive, but only an exact links.al match is allowed.
+        // A title match alone can never unlock a suggestive MangaDex entry.
+        stats.mangaDexSuggestiveFallbackRequests++;
+        const expandedPayload = await fetchJsonLimited(
+          buildSearchUrl(["safe", "suggestive"]).toString()
+        );
+        let expandedItems = Array.isArray(expandedPayload?.data)
+          ? expandedPayload.data
+          : [];
+
+        // MangaDex relevance ordering can place the exact series below the
+        // first page. Scan at most 100 lightweight metadata records, in two
+        // bounded requests, rather than increasing one response/body buffer.
+        const alreadyHasExactId = expandedItems.some(
+          (item) =>
+            String(item?.attributes?.links?.al || "").trim() ===
+            String(anilistId).trim()
+        );
+        const expandedTotal = Number(expandedPayload?.total || expandedItems.length);
+        if (
+          !alreadyHasExactId &&
+          expandedItems.length < expandedTotal &&
+          expandedItems.length < MANGADEX_MATCH_SCAN_MAX
+        ) {
+          const remaining = MANGADEX_MATCH_SCAN_MAX - expandedItems.length;
+          const secondLimit = Math.min(MANGADEX_MATCH_LIMIT, remaining);
+          if (secondLimit > 0) {
+            const secondPayload = await fetchJsonLimited(
+              buildSearchUrl(
+                ["safe", "suggestive"],
+                expandedItems.length,
+                secondLimit
+              ).toString()
+            );
+            expandedItems = expandedItems.concat(secondPayload?.data || []);
+          }
+        }
+
+        match = pickMangaDexMatch(
+          expandedItems,
+          title,
+          anilistId,
+          {
+            allowTitleFallback: false,
+            noMatchMessage: "No exact MangaDex AniList match found",
+            noMatchReason: "no-safe-or-suggestive-anilist-id-match",
+            matchedBySuffix: "-suggestive-fallback",
+          }
+        );
+        stats.mangaDexSuggestiveFallbackMatches++;
+      }
+    } else {
+      match = pickMangaDexMatch(
+        safePayload?.data || [],
+        title,
+        null,
+        {
+          allowTitleFallback: true,
+          noMatchMessage: "No exact safe MangaDex title match found",
+          noMatchReason: "no-exact-safe-title-match",
+        }
+      );
+    }
+
     const selected = match.item;
-
     return {
       id: selected.id,
       title: mangaDexDisplayTitle(selected, title),
       originalLanguage: selected?.attributes?.originalLanguage || null,
+      contentRating: selected?.attributes?.contentRating || null,
       matchedBy: match.matchedBy,
     };
   });
@@ -2347,6 +2478,7 @@ app.get("/catalog/manga-covers", async (req, res) => {
         title: manga.title || mainTitle,
         originalLanguage: manga.originalLanguage || null,
         matchedBy: manga.matchedBy,
+        contentRating: manga.contentRating || null,
       },
       coverCatalog: {
         rawTotal: coverCatalog.value.rawTotal,
