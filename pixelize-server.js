@@ -1,5 +1,5 @@
 // =====================================================================
-//  Paint Any Anime backend (v2.6.0 - Rekognition moderation + safe-first MangaDex matching + exact AniList suggestive fallback)
+//  Paint Any Anime backend (v2.6.1 - Roblox-specific Rekognition policy + moderation + safe-first MangaDex matching + exact AniList suggestive fallback)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -92,9 +92,9 @@ function hasZstd() {
 
 // ---------- CONFIG ----------
 const PORT = Number(process.env.PORT || 3000);
-const API_VERSION = "2.6.0";
+const API_VERSION = "2.6.1";
 const IMAGE_FETCH_USER_AGENT =
-  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.6.0";
+  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.6.1";
 
 
 // Legacy MAX_CACHE_ITEMS is retained only as a preview-cache fallback.
@@ -155,6 +155,14 @@ const AWS_REKOGNITION_JPEG_QUALITY = Math.max(40, Math.min(95, Number(
   process.env.AWS_REKOGNITION_JPEG_QUALITY || 85
 )));
 
+// Policy v1 intentionally targets sexual/nudity risk for Roblox artwork.
+// Generic parent labels, male nipples, bare backs, ordinary swimwear,
+// violence, weapons, alcohol and kissing do not block by themselves.
+const MODERATION_POLICY_VERSION = "roblox-sexual-safety-v1";
+const MODERATION_POLICY_BACKFILL_BATCH = Math.max(25, Math.min(2000, Number(
+  process.env.MODERATION_POLICY_BACKFILL_BATCH || 250
+)));
+
 const moderationConfigured = Boolean(
   rekognitionSdk &&
   rekognitionSdk.RekognitionClient &&
@@ -199,7 +207,7 @@ const MANGADEX_API_BASE = process.env.MANGADEX_API_BASE || "https://api.mangadex
 const MANGADEX_COVER_BASE =
   process.env.MANGADEX_COVER_BASE || "https://uploads.mangadex.org/covers";
 const MANGADEX_USER_AGENT =
-  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.6.0";
+  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.6.1";
 const MANGADEX_COVER_VARIANT = String(
   process.env.MANGADEX_COVER_VARIANT || "512"
 ).trim();
@@ -406,6 +414,10 @@ let putModerationResultSql;
 let touchModerationUrlSql;
 let touchModerationResultSql;
 let countModerationResultsSql;
+let updateModerationPolicySql;
+let selectModerationPolicyBackfillSql;
+let countModerationPolicySql;
+let moderationPolicyBackfillTransaction;
 
 const pendingDiskTouches = new Map();
 const lastPersistedDiskTouch = new Map();
@@ -439,7 +451,13 @@ if (sqlite) {
         moderationModelVersion TEXT,
         contentTypesJson   TEXT NOT NULL,
         checkedAt          INTEGER NOT NULL,
-        lastUsedAt         INTEGER NOT NULL
+        lastUsedAt         INTEGER NOT NULL,
+        policyVersion      TEXT,
+        policyDecision     TEXT,
+        matchedRule        TEXT,
+        matchedLabel       TEXT,
+        matchedConfidence  REAL,
+        policyEvaluatedAt  INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_moderation_lastUsed
         ON moderation_results(lastUsedAt);
@@ -460,6 +478,34 @@ if (sqlite) {
     if (!columns.some((column) => column.name === "pixelsZstd")) {
       db.exec("ALTER TABLE cache ADD COLUMN pixelsZstd BLOB");
       console.log("[cache] added pixelsZstd column to existing database");
+    }
+
+    // Add moderation policy audit columns without deleting existing AWS
+    // labels. Existing rows are re-evaluated locally under the current policy;
+    // no additional Rekognition calls are required.
+    const moderationColumns = db.prepare(
+      "PRAGMA table_info(moderation_results)"
+    ).all();
+    const moderationColumnNames = new Set(
+      moderationColumns.map((column) => column.name)
+    );
+    const moderationPolicyColumns = [
+      ["policyVersion", "TEXT"],
+      ["policyDecision", "TEXT"],
+      ["matchedRule", "TEXT"],
+      ["matchedLabel", "TEXT"],
+      ["matchedConfidence", "REAL"],
+      ["policyEvaluatedAt", "INTEGER"],
+    ];
+    for (const [columnName, columnType] of moderationPolicyColumns) {
+      if (!moderationColumnNames.has(columnName)) {
+        db.exec(
+          `ALTER TABLE moderation_results ADD COLUMN ${columnName} ${columnType}`
+        );
+        console.log(
+          `[moderation] added ${columnName} column to existing database`
+        );
+      }
     }
 
     getV1Sql = db.prepare(
@@ -492,7 +538,9 @@ if (sqlite) {
     getModerationByUrlSql = db.prepare(`
       SELECT
         r.imageHash, r.verdict, r.labelsJson, r.moderationModelVersion,
-        r.contentTypesJson, r.checkedAt, r.lastUsedAt
+        r.contentTypesJson, r.checkedAt, r.lastUsedAt,
+        r.policyVersion, r.policyDecision, r.matchedRule, r.matchedLabel,
+        r.matchedConfidence, r.policyEvaluatedAt
       FROM moderation_urls AS u
       JOIN moderation_results AS r ON r.imageHash = u.imageHash
       WHERE u.imageUrl = ?
@@ -500,7 +548,9 @@ if (sqlite) {
     getModerationByHashSql = db.prepare(`
       SELECT
         imageHash, verdict, labelsJson, moderationModelVersion,
-        contentTypesJson, checkedAt, lastUsedAt
+        contentTypesJson, checkedAt, lastUsedAt,
+        policyVersion, policyDecision, matchedRule, matchedLabel,
+        matchedConfidence, policyEvaluatedAt
       FROM moderation_results
       WHERE imageHash = ?
     `);
@@ -533,6 +583,49 @@ if (sqlite) {
     countModerationResultsSql = db.prepare(
       "SELECT COUNT(*) AS n FROM moderation_results"
     );
+    updateModerationPolicySql = db.prepare(`
+      UPDATE moderation_results
+      SET policyVersion = ?,
+          policyDecision = ?,
+          matchedRule = ?,
+          matchedLabel = ?,
+          matchedConfidence = ?,
+          policyEvaluatedAt = ?,
+          lastUsedAt = ?
+      WHERE imageHash = ?
+    `);
+    selectModerationPolicyBackfillSql = db.prepare(`
+      SELECT imageHash, verdict, labelsJson
+      FROM moderation_results
+      WHERE policyVersion IS NULL OR policyVersion != ?
+      LIMIT ?
+    `);
+    countModerationPolicySql = db.prepare(`
+      SELECT policyDecision, COUNT(*) AS n
+      FROM moderation_results
+      WHERE policyVersion = ?
+      GROUP BY policyDecision
+    `);
+    moderationPolicyBackfillTransaction = db.transaction((rows, evaluatedAt) => {
+      for (const row of rows) {
+        const result = {
+          imageHash: row.imageHash,
+          verdict: row.verdict,
+          labels: parseJsonArray(row.labelsJson),
+        };
+        const policy = evaluateModerationPolicy(result);
+        updateModerationPolicySql.run(
+          policy.policyVersion,
+          policy.policyDecision,
+          policy.matchedRule,
+          policy.matchedLabel,
+          policy.matchedConfidence,
+          evaluatedAt,
+          evaluatedAt,
+          row.imageHash
+        );
+      }
+    });
 
     console.log(`[cache] disk cache at ${DB_PATH}`);
   } catch (error) {
@@ -1073,6 +1166,14 @@ const stats = {
   moderationThrottles: 0,
   moderationRetries: 0,
   moderationInflightDedupes: 0,
+  moderationPolicyEvaluations: 0,
+  moderationWouldAllow: 0,
+  moderationWouldBlock: 0,
+  moderationWouldUncertain: 0,
+  moderationEnforcedBlock: 0,
+  moderationEnforcedUncertain: 0,
+  moderationPolicyBackfilled: 0,
+  moderationPolicyBackfillFailures: 0,
 };
 
 // ---------- Peak memory, spike and garbage-collection telemetry ----------
@@ -1630,6 +1731,7 @@ function moderationHealthSnapshot() {
     enforcing: AWS_REKOGNITION_ENFORCE,
     configured: moderationConfigured,
     operational,
+    policyVersion: MODERATION_POLICY_VERSION,
   };
 }
 
@@ -1669,6 +1771,270 @@ function parseJsonArray(value) {
   }
 }
 
+// ---------- Roblox moderation policy ----------
+const MODERATION_POLICY_RULES = Object.freeze([
+  {
+    id: "explicit-sexual-activity",
+    label: "Explicit Sexual Activity",
+    blockAt: 70,
+    uncertainAt: 50,
+    priority: 100,
+  },
+  {
+    id: "exposed-male-genitalia",
+    label: "Exposed Male Genitalia",
+    blockAt: 70,
+    uncertainAt: 50,
+    priority: 99,
+  },
+  {
+    id: "exposed-female-genitalia",
+    label: "Exposed Female Genitalia",
+    blockAt: 70,
+    uncertainAt: 50,
+    priority: 99,
+  },
+  {
+    id: "exposed-female-nipple",
+    label: "Exposed Female Nipple",
+    blockAt: 70,
+    uncertainAt: 50,
+    priority: 98,
+  },
+  {
+    id: "exposed-buttocks-or-anus",
+    label: "Exposed Buttocks or Anus",
+    blockAt: 70,
+    uncertainAt: 50,
+    priority: 97,
+  },
+  {
+    // L2 fallback for the unlikely case where AWS returns Explicit Nudity
+    // without one of its more specific L3 child labels.
+    id: "explicit-nudity-fallback",
+    label: "Explicit Nudity",
+    blockAt: 90,
+    uncertainAt: 70,
+    priority: 90,
+  },
+  {
+    id: "partially-exposed-female-breast",
+    label: "Partially Exposed Female Breast",
+    blockAt: 80,
+    uncertainAt: 60,
+    priority: 80,
+  },
+  {
+    id: "partially-exposed-buttocks",
+    label: "Partially Exposed Buttocks",
+    blockAt: 80,
+    uncertainAt: 60,
+    priority: 75,
+  },
+  {
+    id: "implied-nudity",
+    label: "Implied Nudity",
+    blockAt: 80,
+    uncertainAt: 60,
+    priority: 70,
+  },
+  {
+    id: "obstructed-intimate-parts",
+    label: "Obstructed Intimate Parts",
+    blockAt: 80,
+    uncertainAt: 60,
+    priority: 70,
+  },
+]);
+
+function normalisePolicyLabelName(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function choosePolicyMatch(matches) {
+  if (matches.length === 0) return null;
+  return matches.sort(
+    (a, b) =>
+      b.priority - a.priority ||
+      b.confidence - a.confidence ||
+      a.rule.localeCompare(b.rule)
+  )[0];
+}
+
+function evaluateModerationPolicy(result) {
+  const labels = Array.isArray(result?.labels) ? result.labels : [];
+  const labelsByName = new Map();
+
+  for (const label of labels) {
+    const name = normalisePolicyLabelName(label?.name);
+    if (!name) continue;
+    const confidence = Number(label?.confidence || 0);
+    const previous = labelsByName.get(name);
+    if (!previous || confidence > previous.confidence) {
+      labelsByName.set(name, {
+        name: String(label?.name || ""),
+        confidence,
+      });
+    }
+  }
+
+  const blockMatches = [];
+  const uncertainMatches = [];
+
+  for (const rule of MODERATION_POLICY_RULES) {
+    const detected = labelsByName.get(normalisePolicyLabelName(rule.label));
+    if (!detected) continue;
+
+    const match = {
+      rule: rule.id,
+      label: detected.name,
+      confidence: Number(detected.confidence.toFixed(2)),
+      priority: rule.priority,
+    };
+
+    if (detected.confidence >= rule.blockAt) {
+      blockMatches.push(match);
+    } else if (detected.confidence >= rule.uncertainAt) {
+      uncertainMatches.push(match);
+    }
+  }
+
+  const blockMatch = choosePolicyMatch(blockMatches);
+  if (blockMatch) {
+    return {
+      policyVersion: MODERATION_POLICY_VERSION,
+      policyDecision: "block",
+      matchedRule: blockMatch.rule,
+      matchedLabel: blockMatch.label,
+      matchedConfidence: blockMatch.confidence,
+    };
+  }
+
+  const uncertainMatch = choosePolicyMatch(uncertainMatches);
+  if (uncertainMatch) {
+    return {
+      policyVersion: MODERATION_POLICY_VERSION,
+      policyDecision: "uncertain",
+      matchedRule: uncertainMatch.rule,
+      matchedLabel: uncertainMatch.label,
+      matchedConfidence: uncertainMatch.confidence,
+    };
+  }
+
+  const strongestLabel = labels
+    .filter((label) => label?.name)
+    .sort((a, b) => Number(b?.confidence || 0) - Number(a?.confidence || 0))[0];
+
+  return {
+    policyVersion: MODERATION_POLICY_VERSION,
+    policyDecision: "allow",
+    matchedRule:
+      labels.length > 0 ? "no-sexual-safety-rule-matched" : "no-labels",
+    matchedLabel: strongestLabel ? String(strongestLabel.name) : null,
+    matchedConfidence: strongestLabel
+      ? Number(Number(strongestLabel.confidence || 0).toFixed(2))
+      : null,
+  };
+}
+
+function moderationPolicyChanged(result, policy) {
+  return (
+    result?.policyVersion !== policy.policyVersion ||
+    result?.policyDecision !== policy.policyDecision ||
+    result?.matchedRule !== policy.matchedRule ||
+    result?.matchedLabel !== policy.matchedLabel ||
+    Number(result?.matchedConfidence ?? -1) !==
+      Number(policy.matchedConfidence ?? -1)
+  );
+}
+
+function persistModerationPolicy(result, policy) {
+  if (
+    !db ||
+    !updateModerationPolicySql ||
+    !result?.imageHash ||
+    !moderationPolicyChanged(result, policy)
+  ) {
+    return;
+  }
+
+  const now = Date.now();
+  updateModerationPolicySql.run(
+    policy.policyVersion,
+    policy.policyDecision,
+    policy.matchedRule,
+    policy.matchedLabel,
+    policy.matchedConfidence,
+    now,
+    now,
+    result.imageHash
+  );
+
+  result.policyVersion = policy.policyVersion;
+  result.policyDecision = policy.policyDecision;
+  result.matchedRule = policy.matchedRule;
+  result.matchedLabel = policy.matchedLabel;
+  result.matchedConfidence = policy.matchedConfidence;
+  result.policyEvaluatedAt = now;
+}
+
+function recordModerationPolicyDecision(policy) {
+  stats.moderationPolicyEvaluations++;
+  if (policy.policyDecision === "block") stats.moderationWouldBlock++;
+  else if (policy.policyDecision === "uncertain") {
+    stats.moderationWouldUncertain++;
+  } else {
+    stats.moderationWouldAllow++;
+  }
+}
+
+function recordEnforcedModerationDecision(decision) {
+  stats.moderationBlocked++;
+  if (decision.policyDecision === "uncertain") {
+    stats.moderationEnforcedUncertain++;
+  } else {
+    stats.moderationEnforcedBlock++;
+  }
+}
+
+async function runModerationPolicyBackfill() {
+  if (
+    !db ||
+    !selectModerationPolicyBackfillSql ||
+    !moderationPolicyBackfillTransaction
+  ) {
+    return;
+  }
+
+  let updated = 0;
+  try {
+    while (true) {
+      const rows = selectModerationPolicyBackfillSql.all(
+        MODERATION_POLICY_VERSION,
+        MODERATION_POLICY_BACKFILL_BATCH
+      );
+      if (rows.length === 0) break;
+
+      moderationPolicyBackfillTransaction(rows, Date.now());
+      updated += rows.length;
+      stats.moderationPolicyBackfilled += rows.length;
+
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    if (updated > 0) {
+      console.log(
+        `[moderation] policy ${MODERATION_POLICY_VERSION} ` +
+          `backfilled ${updated} cached image decisions without AWS calls`
+      );
+    }
+  } catch (error) {
+    stats.moderationPolicyBackfillFailures++;
+    console.warn("[moderation] policy backfill failed -", error.message);
+  }
+}
+// ---------- End Roblox moderation policy ----------
+
 function moderationRowToResult(row) {
   if (!row) return null;
   return {
@@ -1678,6 +2044,13 @@ function moderationRowToResult(row) {
     moderationModelVersion: row.moderationModelVersion || null,
     contentTypes: parseJsonArray(row.contentTypesJson),
     checkedAt: Number(row.checkedAt || 0),
+    policyVersion: row.policyVersion || null,
+    policyDecision: row.policyDecision || null,
+    matchedRule: row.matchedRule || null,
+    matchedLabel: row.matchedLabel || null,
+    matchedConfidence:
+      row.matchedConfidence == null ? null : Number(row.matchedConfidence),
+    policyEvaluatedAt: Number(row.policyEvaluatedAt || 0),
   };
 }
 
@@ -1906,9 +2279,16 @@ async function sendRekognitionRequest(jpegBuffer) {
 
 function moderationDecision(result, imageBuffer = null, source = "cache") {
   const hasLabels = result.verdict === "labels_detected";
-  const allowed = !AWS_REKOGNITION_ENFORCE || result.verdict === "no_labels";
+  const policy = evaluateModerationPolicy(result);
+  persistModerationPolicy(result, policy);
+  recordModerationPolicyDecision(policy);
+
+  const allowed =
+    !AWS_REKOGNITION_ENFORCE || policy.policyDecision === "allow";
+
   return {
     ...result,
+    ...policy,
     hasLabels,
     allowed,
     imageBuffer,
@@ -1916,10 +2296,17 @@ function moderationDecision(result, imageBuffer = null, source = "cache") {
   };
 }
 
-function moderationBlockedError() {
-  const error = new Error("image blocked by moderation");
+function moderationBlockedError(decision) {
+  const uncertain = decision?.policyDecision === "uncertain";
+  const error = new Error(
+    uncertain
+      ? "image unavailable pending moderation review"
+      : "image blocked by moderation policy"
+  );
   error.code = 403;
   error.moderationBlocked = true;
+  error.policyDecision = decision?.policyDecision || "block";
+  error.matchedRule = decision?.matchedRule || null;
   return error;
 }
 
@@ -1949,8 +2336,8 @@ async function ensureImageModerated(imageUrl) {
     else stats.moderationLabelsDetected++;
     const decision = moderationDecision(directHit, null, "url-cache");
     if (!decision.allowed) {
-      stats.moderationBlocked++;
-      throw moderationBlockedError();
+      recordEnforcedModerationDecision(decision);
+      throw moderationBlockedError(decision);
     }
     return decision;
   }
@@ -1969,8 +2356,8 @@ async function ensureImageModerated(imageUrl) {
       stats.moderationCacheHits++;
       const decision = moderationDecision(lateHit, null, "url-cache");
       if (!decision.allowed) {
-        stats.moderationBlocked++;
-        throw moderationBlockedError();
+        recordEnforcedModerationDecision(decision);
+        throw moderationBlockedError(decision);
       }
       return decision;
     }
@@ -1992,8 +2379,8 @@ async function ensureImageModerated(imageUrl) {
         stats.moderationCacheHits++;
         const decision = moderationDecision(hashHit, imageBuffer, "hash-cache");
         if (!decision.allowed) {
-          stats.moderationBlocked++;
-          throw moderationBlockedError();
+          recordEnforcedModerationDecision(decision);
+          throw moderationBlockedError(decision);
         }
         return decision;
       }
@@ -2017,8 +2404,8 @@ async function ensureImageModerated(imageUrl) {
 
       const decision = moderationDecision(result, imageBuffer, "aws");
       if (!decision.allowed) {
-        stats.moderationBlocked++;
-        throw moderationBlockedError();
+        recordEnforcedModerationDecision(decision);
+        throw moderationBlockedError(decision);
       }
       return decision;
     } catch (error) {
@@ -2878,6 +3265,19 @@ app.get("/stats", (req, res) => {
   const moderationRow = db && countModerationResultsSql
     ? countModerationResultsSql.get()
     : { n: 0 };
+  const policyDecisionRows = db && countModerationPolicySql
+    ? countModerationPolicySql.all(MODERATION_POLICY_VERSION)
+    : [];
+  const policyCachedDecisions = {
+    allow: 0,
+    block: 0,
+    uncertain: 0,
+  };
+  for (const row of policyDecisionRows) {
+    if (row.policyDecision in policyCachedDecisions) {
+      policyCachedDecisions[row.policyDecision] = Number(row.n || 0);
+    }
+  }
   const compressionRatio =
     stats.v2CompressedBytesSent > 0
       ? Number(
@@ -2944,6 +3344,7 @@ app.get("/stats", (req, res) => {
       queued: moderationQueued,
       inflight: moderationInflight.size,
       cachedImages: Number(moderationRow.n || 0),
+      policyCachedDecisions,
       lastSuccessAt: moderationLastSuccessAt
         ? new Date(moderationLastSuccessAt).toISOString()
         : null,
@@ -3377,7 +3778,12 @@ app.post("/pixelize", async (req, res) => {
     }
 
     if (error && error.code === 403 && error.moderationBlocked) {
-      return res.status(403).json({ error: "image blocked by moderation" });
+      return res.status(403).json({
+        error:
+          error.policyDecision === "uncertain"
+            ? "image unavailable pending moderation review"
+            : "image blocked by moderation policy",
+      });
     }
 
     if (error && error.code === 503) {
@@ -3462,7 +3868,8 @@ async function startServer() {
       `  Rekognition enabled=${AWS_REKOGNITION_ENABLED} ` +
         `enforcing=${AWS_REKOGNITION_ENFORCE} ` +
         `configured=${moderationConfigured} ` +
-        `region=${AWS_REGION} concurrency=${AWS_REKOGNITION_MAX_CONCURRENCY}`
+        `region=${AWS_REGION} concurrency=${AWS_REKOGNITION_MAX_CONCURRENCY} ` +
+        `policy=${MODERATION_POLICY_VERSION}`
     );
     console.log(
       `  memoryTelemetry rss=${MEMORY_RSS_SAMPLE_MS}ms ` +
@@ -3470,6 +3877,16 @@ async function startServer() {
         `spikeHeap=${MEMORY_HEAP_SPIKE_MB}MB ` +
         `spikeRss=${MEMORY_RSS_SPIKE_MB}MB`
     );
+
+    setImmediate(() => {
+      runModerationPolicyBackfill().catch((error) => {
+        stats.moderationPolicyBackfillFailures++;
+        console.warn(
+          "[moderation] policy backfill startup failure -",
+          error.message
+        );
+      });
+    });
   });
 }
 
