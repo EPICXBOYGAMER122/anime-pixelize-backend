@@ -1,6 +1,6 @@
 {
   "name": "anime-pixelize-backend",
-  "version": "2.5.2",
+  "version": "2.6.0",
   "main": "pixelize-server.js",
   "scripts": {
     "start": "node pixelize-server.js",
@@ -8,6 +8,7 @@
     "check": "node --check pixelize-server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-rekognition": "^3.1090.0",
     "@bokuweb/zstd-wasm": "^0.0.27",
     "better-sqlite3": "^11.8.1",
     "express": "^4.22.2",
