@@ -1,5 +1,5 @@
 // =====================================================================
-//  Paint Any Anime backend (v2.6.1 - Roblox-specific Rekognition policy + moderation + safe-first MangaDex matching + exact AniList suggestive fallback)
+//  Paint Any Anime backend (v2.6.2 - Studio-scoped real enforcement override + Roblox-specific Rekognition policy + moderation + safe-first MangaDex matching + exact AniList suggestive fallback)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -92,9 +92,9 @@ function hasZstd() {
 
 // ---------- CONFIG ----------
 const PORT = Number(process.env.PORT || 3000);
-const API_VERSION = "2.6.1";
+const API_VERSION = "2.6.2";
 const IMAGE_FETCH_USER_AGENT =
-  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.6.1";
+  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.6.2";
 
 
 // Legacy MAX_CACHE_ITEMS is retained only as a preview-cache fallback.
@@ -132,6 +132,47 @@ const AWS_REGION = String(process.env.AWS_REGION || "eu-west-2").trim();
 const AWS_REKOGNITION_ENABLED = envBoolean("AWS_REKOGNITION_ENABLED", false);
 const AWS_REKOGNITION_ENFORCE =
   AWS_REKOGNITION_ENABLED && envBoolean("AWS_REKOGNITION_ENFORCE", false);
+
+// Optional request-scoped enforcement for unpublished Roblox Studio testing.
+// Global enforcement remains authoritative. The token is read only from the
+// process environment and is never included in health/stats/log output.
+const AWS_REKOGNITION_STUDIO_ENFORCE_ENABLED =
+  AWS_REKOGNITION_ENABLED &&
+  envBoolean("AWS_REKOGNITION_STUDIO_ENFORCE_ENABLED", false);
+const AWS_REKOGNITION_STUDIO_ENFORCE_TOKEN = String(
+  process.env.AWS_REKOGNITION_STUDIO_ENFORCE_TOKEN || ""
+).trim();
+const AWS_REKOGNITION_STUDIO_ENFORCE_HEADER =
+  "X-PAA-Studio-Enforce-Token";
+const AWS_REKOGNITION_STUDIO_TOKEN_MIN_BYTES = 32;
+const AWS_REKOGNITION_STUDIO_TOKEN_CONFIGURED = Boolean(
+  AWS_REKOGNITION_STUDIO_ENFORCE_ENABLED &&
+  Buffer.byteLength(AWS_REKOGNITION_STUDIO_ENFORCE_TOKEN, "utf8") >=
+    AWS_REKOGNITION_STUDIO_TOKEN_MIN_BYTES
+);
+
+function hasValidStudioEnforcementToken(req) {
+  if (!AWS_REKOGNITION_STUDIO_TOKEN_CONFIGURED || !req) return false;
+
+  const supplied = req.get(AWS_REKOGNITION_STUDIO_ENFORCE_HEADER);
+  if (typeof supplied !== "string" || supplied.length === 0) return false;
+
+  const expectedBuffer = Buffer.from(
+    AWS_REKOGNITION_STUDIO_ENFORCE_TOKEN,
+    "utf8"
+  );
+  const suppliedBuffer = Buffer.from(supplied, "utf8");
+  if (expectedBuffer.length !== suppliedBuffer.length) return false;
+
+  return crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+function effectiveModerationEnforcementForRequest(req) {
+  return Boolean(
+    AWS_REKOGNITION_ENFORCE || hasValidStudioEnforcementToken(req)
+  );
+}
+
 const AWS_REKOGNITION_MIN_CONFIDENCE = Math.max(0, Math.min(100, Number(
   process.env.AWS_REKOGNITION_MIN_CONFIDENCE || 50
 )));
@@ -207,7 +248,7 @@ const MANGADEX_API_BASE = process.env.MANGADEX_API_BASE || "https://api.mangadex
 const MANGADEX_COVER_BASE =
   process.env.MANGADEX_COVER_BASE || "https://uploads.mangadex.org/covers";
 const MANGADEX_USER_AGENT =
-  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.6.1";
+  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.6.2";
 const MANGADEX_COVER_VARIANT = String(
   process.env.MANGADEX_COVER_VARIANT || "512"
 ).trim();
@@ -2283,14 +2324,13 @@ function moderationDecision(result, imageBuffer = null, source = "cache") {
   persistModerationPolicy(result, policy);
   recordModerationPolicyDecision(policy);
 
-  const allowed =
-    !AWS_REKOGNITION_ENFORCE || policy.policyDecision === "allow";
-
   return {
     ...result,
     ...policy,
     hasLabels,
-    allowed,
+    // This field represents the policy verdict itself. Shadow-mode callers are
+    // permitted separately by applyModerationEnforcement().
+    allowed: policy.policyDecision === "allow",
     imageBuffer,
     source,
   };
@@ -2318,15 +2358,46 @@ function moderationUnavailableError(error) {
   return wrapped;
 }
 
-async function ensureImageModerated(imageUrl) {
+function applyModerationEnforcement(decision, effectiveEnforcement) {
+  if (!effectiveEnforcement) {
+    return { ...decision, allowed: true };
+  }
+
+  if (decision?.moderationUnavailable) {
+    throw moderationUnavailableError(decision.moderationErrorCause);
+  }
+
+  if (decision?.policyDecision !== "allow") {
+    recordEnforcedModerationDecision(decision);
+    throw moderationBlockedError(decision);
+  }
+
+  return { ...decision, allowed: true };
+}
+
+async function ensureImageModerated(
+  imageUrl,
+  effectiveEnforcement = AWS_REKOGNITION_ENFORCE
+) {
   if (!AWS_REKOGNITION_ENABLED) {
-    return { verdict: "disabled", allowed: true, imageBuffer: null, source: "disabled" };
+    return {
+      verdict: "disabled",
+      allowed: true,
+      imageBuffer: null,
+      source: "disabled",
+    };
   }
 
   if (!moderationConfigured) {
     stats.moderationErrors++;
-    if (AWS_REKOGNITION_ENFORCE) throw moderationUnavailableError();
-    return { verdict: "error", allowed: true, imageBuffer: null, source: "unconfigured" };
+    if (effectiveEnforcement) throw moderationUnavailableError();
+    return {
+      verdict: "error",
+      allowed: true,
+      imageBuffer: null,
+      source: "unconfigured",
+      moderationUnavailable: true,
+    };
   }
 
   const directHit = loadModerationByUrl(imageUrl);
@@ -2334,36 +2405,31 @@ async function ensureImageModerated(imageUrl) {
     stats.moderationCacheHits++;
     if (directHit.verdict === "no_labels") stats.moderationNoLabels++;
     else stats.moderationLabelsDetected++;
-    const decision = moderationDecision(directHit, null, "url-cache");
-    if (!decision.allowed) {
-      recordEnforcedModerationDecision(decision);
-      throw moderationBlockedError(decision);
-    }
-    return decision;
+
+    return applyModerationEnforcement(
+      moderationDecision(directHit, null, "url-cache"),
+      effectiveEnforcement
+    );
   }
 
-  const existing = moderationInflight.get(imageUrl);
-  if (existing) {
+  let promise = moderationInflight.get(imageUrl);
+  if (promise) {
     stats.moderationInflightDedupes++;
-    return existing;
-  }
-
-  stats.moderationCacheMisses++;
-  const promise = withModerationSlot(async () => {
-    // Recheck after waiting for the queue.
-    const lateHit = loadModerationByUrl(imageUrl);
-    if (lateHit) {
-      stats.moderationCacheHits++;
-      const decision = moderationDecision(lateHit, null, "url-cache");
-      if (!decision.allowed) {
-        recordEnforcedModerationDecision(decision);
-        throw moderationBlockedError(decision);
-      }
-      return decision;
-    }
-
+  } else {
+    stats.moderationCacheMisses++;
     let imageBuffer = null;
-    try {
+
+    // The shared in-flight promise computes the real moderation decision only.
+    // Each waiting request applies its own enforcement mode afterwards, so a
+    // Studio-enforced request can safely share work with a live shadow request.
+    promise = withModerationSlot(async () => {
+      // Recheck after waiting for the queue.
+      const lateHit = loadModerationByUrl(imageUrl);
+      if (lateHit) {
+        stats.moderationCacheHits++;
+        return moderationDecision(lateHit, null, "url-cache");
+      }
+
       beginOperation("moderationDownloads");
       try {
         imageBuffer = await downloadAllowedImage(imageUrl);
@@ -2371,18 +2437,16 @@ async function ensureImageModerated(imageUrl) {
         endOperation("moderationDownloads");
       }
 
-      const imageHash = crypto.createHash("sha256").update(imageBuffer).digest("hex");
+      const imageHash = crypto
+        .createHash("sha256")
+        .update(imageBuffer)
+        .digest("hex");
       saveModerationUrl(imageUrl, imageHash);
 
       const hashHit = loadModerationByHash(imageHash);
       if (hashHit) {
         stats.moderationCacheHits++;
-        const decision = moderationDecision(hashHit, imageBuffer, "hash-cache");
-        if (!decision.allowed) {
-          recordEnforcedModerationDecision(decision);
-          throw moderationBlockedError(decision);
-        }
-        return decision;
+        return moderationDecision(hashHit, imageBuffer, "hash-cache");
       }
 
       const moderationJpeg = await createModerationJpeg(imageBuffer);
@@ -2402,31 +2466,30 @@ async function ensureImageModerated(imageUrl) {
       if (result.verdict === "no_labels") stats.moderationNoLabels++;
       else stats.moderationLabelsDetected++;
 
-      const decision = moderationDecision(result, imageBuffer, "aws");
-      if (!decision.allowed) {
-        recordEnforcedModerationDecision(decision);
-        throw moderationBlockedError(decision);
-      }
-      return decision;
-    } catch (error) {
-      if (error?.moderationBlocked) throw error;
-      stats.moderationErrors++;
-      console.warn(
-        "[moderation] check failed -",
-        String(error?.name || error?.code || error?.message || "error")
-      );
-      if (AWS_REKOGNITION_ENFORCE) throw moderationUnavailableError(error);
-      return {
-        verdict: "error",
-        allowed: true,
-        imageBuffer,
-        source: "error-shadow",
-      };
-    }
-  }).finally(() => moderationInflight.delete(imageUrl));
+      return moderationDecision(result, imageBuffer, "aws");
+    })
+      .catch((error) => {
+        stats.moderationErrors++;
+        console.warn(
+          "[moderation] check failed -",
+          String(error?.name || error?.code || error?.message || "error")
+        );
+        return {
+          verdict: "error",
+          allowed: true,
+          imageBuffer,
+          source: "error-shadow",
+          moderationUnavailable: true,
+          moderationErrorCause: error,
+        };
+      })
+      .finally(() => moderationInflight.delete(imageUrl));
 
-  moderationInflight.set(imageUrl, promise);
-  return promise;
+    moderationInflight.set(imageUrl, promise);
+  }
+
+  const decision = await promise;
+  return applyModerationEnforcement(decision, effectiveEnforcement);
 }
 
 function normaliseSearchText(value) {
@@ -3624,7 +3687,14 @@ app.post("/pixelize", async (req, res) => {
     // This prevents artwork cached before moderation was introduced from
     // bypassing enforcement. A first-time check returns the downloaded source
     // buffer so the generation path can reuse it without a second download.
-    const moderationResult = await ensureImageModerated(imageUrl);
+    // The effective mode is request-scoped: global enforcement applies to all
+    // callers, while a valid secret header can enforce only a Studio request.
+    const effectiveModerationEnforcement =
+      effectiveModerationEnforcementForRequest(req);
+    const moderationResult = await ensureImageModerated(
+      imageUrl,
+      effectiveModerationEnforcement
+    );
     let moderatedImageBuffer = moderationResult.imageBuffer || null;
 
     // 1) Memory cache.
