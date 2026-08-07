@@ -1,5 +1,5 @@
 // =====================================================================
-//  Paint Any Anime backend (v2.6.2 - Studio-scoped real enforcement override + Roblox-specific Rekognition policy + moderation + safe-first MangaDex matching + exact AniList suggestive fallback)
+//  Paint Any Anime backend (v2.6.3 - Studio-scoped real enforcement override + Roblox-specific Rekognition policy + moderation + safe-first MangaDex matching + exact AniList suggestive fallback)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -92,9 +92,9 @@ function hasZstd() {
 
 // ---------- CONFIG ----------
 const PORT = Number(process.env.PORT || 3000);
-const API_VERSION = "2.6.2";
+const API_VERSION = "2.6.3";
 const IMAGE_FETCH_USER_AGENT =
-  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.6.2";
+  process.env.IMAGE_FETCH_USER_AGENT || "PaintAnyAnimeBackend/2.6.3";
 
 
 // Legacy MAX_CACHE_ITEMS is retained only as a preview-cache fallback.
@@ -133,6 +133,14 @@ const AWS_REKOGNITION_ENABLED = envBoolean("AWS_REKOGNITION_ENABLED", false);
 const AWS_REKOGNITION_ENFORCE =
   AWS_REKOGNITION_ENABLED && envBoolean("AWS_REKOGNITION_ENFORCE", false);
 
+// Controls whether ordinary non-enforcing public requests still perform paid
+// Rekognition scans in shadow mode. Keep this false during Studio-only testing
+// so live players do not consume Rekognition calls. Global enforcement and a
+// valid Studio override always take precedence and still run moderation.
+const AWS_REKOGNITION_PUBLIC_SHADOW_SCAN =
+  AWS_REKOGNITION_ENABLED &&
+  envBoolean("AWS_REKOGNITION_PUBLIC_SHADOW_SCAN", false);
+
 // Optional request-scoped enforcement for unpublished Roblox Studio testing.
 // Global enforcement remains authoritative. The token is read only from the
 // process environment and is never included in health/stats/log output.
@@ -170,6 +178,15 @@ function hasValidStudioEnforcementToken(req) {
 function effectiveModerationEnforcementForRequest(req) {
   return Boolean(
     AWS_REKOGNITION_ENFORCE || hasValidStudioEnforcementToken(req)
+  );
+}
+
+function shouldModerateRequest(req) {
+  return Boolean(
+    AWS_REKOGNITION_ENABLED &&
+    (AWS_REKOGNITION_ENFORCE ||
+      hasValidStudioEnforcementToken(req) ||
+      AWS_REKOGNITION_PUBLIC_SHADOW_SCAN)
   );
 }
 
@@ -248,7 +265,7 @@ const MANGADEX_API_BASE = process.env.MANGADEX_API_BASE || "https://api.mangadex
 const MANGADEX_COVER_BASE =
   process.env.MANGADEX_COVER_BASE || "https://uploads.mangadex.org/covers";
 const MANGADEX_USER_AGENT =
-  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.6.2";
+  process.env.MANGADEX_USER_AGENT || "PaintAnyAnimeBackend/2.6.3";
 const MANGADEX_COVER_VARIANT = String(
   process.env.MANGADEX_COVER_VARIANT || "512"
 ).trim();
@@ -1198,6 +1215,7 @@ const stats = {
   mangaDexSuggestiveFallbackMatches: 0,
 
   moderationCalls: 0,
+  moderationSkippedPublicShadow: 0,
   moderationCacheHits: 0,
   moderationCacheMisses: 0,
   moderationNoLabels: 0,
@@ -1770,6 +1788,7 @@ function moderationHealthSnapshot() {
   return {
     enabled: AWS_REKOGNITION_ENABLED,
     enforcing: AWS_REKOGNITION_ENFORCE,
+    publicShadowScanning: AWS_REKOGNITION_PUBLIC_SHADOW_SCAN,
     configured: moderationConfigured,
     operational,
     policyVersion: MODERATION_POLICY_VERSION,
@@ -3691,10 +3710,22 @@ app.post("/pixelize", async (req, res) => {
     // callers, while a valid secret header can enforce only a Studio request.
     const effectiveModerationEnforcement =
       effectiveModerationEnforcementForRequest(req);
-    const moderationResult = await ensureImageModerated(
-      imageUrl,
-      effectiveModerationEnforcement
-    );
+    const moderationRequired = shouldModerateRequest(req);
+    let moderationResult;
+    if (moderationRequired) {
+      moderationResult = await ensureImageModerated(
+        imageUrl,
+        effectiveModerationEnforcement
+      );
+    } else {
+      stats.moderationSkippedPublicShadow++;
+      moderationResult = {
+        verdict: "skipped",
+        allowed: true,
+        imageBuffer: null,
+        source: "public-shadow-disabled",
+      };
+    }
     let moderatedImageBuffer = moderationResult.imageBuffer || null;
 
     // 1) Memory cache.
@@ -3937,6 +3968,7 @@ async function startServer() {
     console.log(
       `  Rekognition enabled=${AWS_REKOGNITION_ENABLED} ` +
         `enforcing=${AWS_REKOGNITION_ENFORCE} ` +
+        `publicShadowScan=${AWS_REKOGNITION_PUBLIC_SHADOW_SCAN} ` +
         `configured=${moderationConfigured} ` +
         `region=${AWS_REGION} concurrency=${AWS_REKOGNITION_MAX_CONCURRENCY} ` +
         `policy=${MODERATION_POLICY_VERSION}`
