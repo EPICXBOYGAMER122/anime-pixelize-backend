@@ -1,5 +1,5 @@
 // =====================================================================
-//  Paint Any Anime backend (v2.6.3 - Studio-scoped real enforcement override + Roblox-specific Rekognition policy + moderation + safe-first MangaDex matching + exact AniList suggestive fallback)
+//  Paint Any Anime backend (v2.6.3 - pixelization + compression + safe-first MangaDex matching + exact AniList suggestive fallback)
 //  ------------------------------------------------------------------
 //  Backward-compatible response formats:
 //
@@ -33,7 +33,6 @@ const express = require("express");
 const sharp   = require("sharp");
 const zlib    = require("zlib");
 const path    = require("path");
-const crypto  = require("node:crypto");
 const {
   performance,
   monitorEventLoopDelay,
@@ -50,19 +49,6 @@ try {
   console.warn("[cache] better-sqlite3 unavailable; disk cache disabled -", error.message);
 }
 
-// Amazon Rekognition is optional at process-start so the existing backend can
-// still run with moderation disabled while dependencies or credentials are
-// being deployed. When moderation is enabled, missing SDK/configuration is
-// surfaced through health telemetry and enforcement fails closed.
-let rekognitionSdk = null;
-try {
-  rekognitionSdk = require("@aws-sdk/client-rekognition");
-} catch (error) {
-  console.warn(
-    "[moderation] @aws-sdk/client-rekognition unavailable; moderation disabled -",
-    error.message
-  );
-}
 
 // Zstandard is optional at runtime for safe deployment. If installation
 // fails, the existing formatVersion 1 API continues working. Explicit
@@ -121,125 +107,6 @@ const MAX_DIM = Number(process.env.MAX_DIM || 512);
 const MIN_DIM = Number(process.env.MIN_DIM || 8);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "cache.sqlite");
 
-// ---------- Amazon Rekognition image moderation ----------
-function envBoolean(name, fallback = false) {
-  const raw = process.env[name];
-  if (raw == null || raw === "") return fallback;
-  return /^(1|true|yes|on)$/i.test(String(raw));
-}
-
-const AWS_REGION = String(process.env.AWS_REGION || "eu-west-2").trim();
-const AWS_REKOGNITION_ENABLED = envBoolean("AWS_REKOGNITION_ENABLED", false);
-const AWS_REKOGNITION_ENFORCE =
-  AWS_REKOGNITION_ENABLED && envBoolean("AWS_REKOGNITION_ENFORCE", false);
-
-// Controls whether ordinary non-enforcing public requests still perform paid
-// Rekognition scans in shadow mode. Keep this false during Studio-only testing
-// so live players do not consume Rekognition calls. Global enforcement and a
-// valid Studio override always take precedence and still run moderation.
-const AWS_REKOGNITION_PUBLIC_SHADOW_SCAN =
-  AWS_REKOGNITION_ENABLED &&
-  envBoolean("AWS_REKOGNITION_PUBLIC_SHADOW_SCAN", false);
-
-// Optional request-scoped enforcement for unpublished Roblox Studio testing.
-// Global enforcement remains authoritative. The token is read only from the
-// process environment and is never included in health/stats/log output.
-const AWS_REKOGNITION_STUDIO_ENFORCE_ENABLED =
-  AWS_REKOGNITION_ENABLED &&
-  envBoolean("AWS_REKOGNITION_STUDIO_ENFORCE_ENABLED", false);
-const AWS_REKOGNITION_STUDIO_ENFORCE_TOKEN = String(
-  process.env.AWS_REKOGNITION_STUDIO_ENFORCE_TOKEN || ""
-).trim();
-const AWS_REKOGNITION_STUDIO_ENFORCE_HEADER =
-  "X-PAA-Studio-Enforce-Token";
-const AWS_REKOGNITION_STUDIO_TOKEN_MIN_BYTES = 32;
-const AWS_REKOGNITION_STUDIO_TOKEN_CONFIGURED = Boolean(
-  AWS_REKOGNITION_STUDIO_ENFORCE_ENABLED &&
-  Buffer.byteLength(AWS_REKOGNITION_STUDIO_ENFORCE_TOKEN, "utf8") >=
-    AWS_REKOGNITION_STUDIO_TOKEN_MIN_BYTES
-);
-
-function hasValidStudioEnforcementToken(req) {
-  if (!AWS_REKOGNITION_STUDIO_TOKEN_CONFIGURED || !req) return false;
-
-  const supplied = req.get(AWS_REKOGNITION_STUDIO_ENFORCE_HEADER);
-  if (typeof supplied !== "string" || supplied.length === 0) return false;
-
-  const expectedBuffer = Buffer.from(
-    AWS_REKOGNITION_STUDIO_ENFORCE_TOKEN,
-    "utf8"
-  );
-  const suppliedBuffer = Buffer.from(supplied, "utf8");
-  if (expectedBuffer.length !== suppliedBuffer.length) return false;
-
-  return crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
-}
-
-function effectiveModerationEnforcementForRequest(req) {
-  return Boolean(
-    AWS_REKOGNITION_ENFORCE || hasValidStudioEnforcementToken(req)
-  );
-}
-
-function shouldModerateRequest(req) {
-  return Boolean(
-    AWS_REKOGNITION_ENABLED &&
-    (AWS_REKOGNITION_ENFORCE ||
-      hasValidStudioEnforcementToken(req) ||
-      AWS_REKOGNITION_PUBLIC_SHADOW_SCAN)
-  );
-}
-
-const AWS_REKOGNITION_MIN_CONFIDENCE = Math.max(0, Math.min(100, Number(
-  process.env.AWS_REKOGNITION_MIN_CONFIDENCE || 50
-)));
-const AWS_REKOGNITION_MAX_CONCURRENCY = Math.max(1, Number(
-  process.env.AWS_REKOGNITION_MAX_CONCURRENCY || 4
-));
-const AWS_REKOGNITION_TIMEOUT_MS = Math.max(1000, Number(
-  process.env.AWS_REKOGNITION_TIMEOUT_MS || 5000
-));
-const AWS_REKOGNITION_MAX_QUEUE = Math.max(1, Number(
-  process.env.AWS_REKOGNITION_MAX_QUEUE || 100
-));
-const AWS_REKOGNITION_MAX_IMAGE_BYTES = Math.max(256 * 1024, Math.min(
-  5 * 1024 * 1024,
-  Number(process.env.AWS_REKOGNITION_MAX_IMAGE_BYTES || 4_500_000)
-));
-const AWS_REKOGNITION_MAX_DIM = Math.max(256, Number(
-  process.env.AWS_REKOGNITION_MAX_DIM || 1600
-));
-const AWS_REKOGNITION_JPEG_QUALITY = Math.max(40, Math.min(95, Number(
-  process.env.AWS_REKOGNITION_JPEG_QUALITY || 85
-)));
-
-// Policy v1 intentionally targets sexual/nudity risk for Roblox artwork.
-// Generic parent labels, male nipples, bare backs, ordinary swimwear,
-// violence, weapons, alcohol and kissing do not block by themselves.
-const MODERATION_POLICY_VERSION = "roblox-sexual-safety-v1";
-const MODERATION_POLICY_BACKFILL_BATCH = Math.max(25, Math.min(2000, Number(
-  process.env.MODERATION_POLICY_BACKFILL_BATCH || 250
-)));
-
-const moderationConfigured = Boolean(
-  rekognitionSdk &&
-  rekognitionSdk.RekognitionClient &&
-  rekognitionSdk.DetectModerationLabelsCommand &&
-  AWS_REGION
-);
-
-const rekognitionClient = AWS_REKOGNITION_ENABLED && moderationConfigured
-  ? new rekognitionSdk.RekognitionClient({
-      region: AWS_REGION,
-      // The backend performs one explicit retry for transient failures.
-      // Disable hidden SDK retries so latency and call counts remain bounded.
-      maxAttempts: 1,
-    })
-  : null;
-
-let moderationLastSuccessAt = 0;
-let moderationLastErrorAt = 0;
-let moderationLastErrorCode = null;
 
 // Bound libvips working memory. The pixel cache remains separate and is
 // already bounded by entry count. These defaults trade a small amount of
@@ -417,9 +284,6 @@ const OPERATION_NAMES = [
   "largeCanvasGenerations",
   "catalogRequests",
   "mangaDexRequests",
-  "moderationDownloads",
-  "moderationSharpJobs",
-  "rekognitionRequests",
 ];
 
 const operationTelemetry = {
@@ -465,17 +329,6 @@ let countSql;
 let pruneSql;
 let updateZstdSql;
 let flushTouchesTransaction;
-let getModerationByUrlSql;
-let getModerationByHashSql;
-let putModerationUrlSql;
-let putModerationResultSql;
-let touchModerationUrlSql;
-let touchModerationResultSql;
-let countModerationResultsSql;
-let updateModerationPolicySql;
-let selectModerationPolicyBackfillSql;
-let countModerationPolicySql;
-let moderationPolicyBackfillTransaction;
 
 const pendingDiskTouches = new Map();
 const lastPersistedDiskTouch = new Map();
@@ -502,32 +355,6 @@ if (sqlite) {
       CREATE INDEX IF NOT EXISTS idx_lastUsed ON cache(lastUsedAt);
       CREATE INDEX IF NOT EXISTS idx_mode ON cache(mode);
 
-      CREATE TABLE IF NOT EXISTS moderation_results (
-        imageHash          TEXT PRIMARY KEY,
-        verdict            TEXT NOT NULL,
-        labelsJson         TEXT NOT NULL,
-        moderationModelVersion TEXT,
-        contentTypesJson   TEXT NOT NULL,
-        checkedAt          INTEGER NOT NULL,
-        lastUsedAt         INTEGER NOT NULL,
-        policyVersion      TEXT,
-        policyDecision     TEXT,
-        matchedRule        TEXT,
-        matchedLabel       TEXT,
-        matchedConfidence  REAL,
-        policyEvaluatedAt  INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS idx_moderation_lastUsed
-        ON moderation_results(lastUsedAt);
-
-      CREATE TABLE IF NOT EXISTS moderation_urls (
-        imageUrl    TEXT PRIMARY KEY,
-        imageHash   TEXT NOT NULL,
-        createdAt   INTEGER NOT NULL,
-        lastUsedAt  INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_moderation_url_hash
-        ON moderation_urls(imageHash);
     `);
 
     // Migrate existing databases created before v2.2 without deleting or
@@ -538,33 +365,6 @@ if (sqlite) {
       console.log("[cache] added pixelsZstd column to existing database");
     }
 
-    // Add moderation policy audit columns without deleting existing AWS
-    // labels. Existing rows are re-evaluated locally under the current policy;
-    // no additional Rekognition calls are required.
-    const moderationColumns = db.prepare(
-      "PRAGMA table_info(moderation_results)"
-    ).all();
-    const moderationColumnNames = new Set(
-      moderationColumns.map((column) => column.name)
-    );
-    const moderationPolicyColumns = [
-      ["policyVersion", "TEXT"],
-      ["policyDecision", "TEXT"],
-      ["matchedRule", "TEXT"],
-      ["matchedLabel", "TEXT"],
-      ["matchedConfidence", "REAL"],
-      ["policyEvaluatedAt", "INTEGER"],
-    ];
-    for (const [columnName, columnType] of moderationPolicyColumns) {
-      if (!moderationColumnNames.has(columnName)) {
-        db.exec(
-          `ALTER TABLE moderation_results ADD COLUMN ${columnName} ${columnType}`
-        );
-        console.log(
-          `[moderation] added ${columnName} column to existing database`
-        );
-      }
-    }
 
     getV1Sql = db.prepare(
       "SELECT pixelsGz, w, h FROM cache WHERE key = ?"
@@ -593,97 +393,6 @@ if (sqlite) {
          OR (mode != 'preview' AND lastUsedAt < ?)
     `);
 
-    getModerationByUrlSql = db.prepare(`
-      SELECT
-        r.imageHash, r.verdict, r.labelsJson, r.moderationModelVersion,
-        r.contentTypesJson, r.checkedAt, r.lastUsedAt,
-        r.policyVersion, r.policyDecision, r.matchedRule, r.matchedLabel,
-        r.matchedConfidence, r.policyEvaluatedAt
-      FROM moderation_urls AS u
-      JOIN moderation_results AS r ON r.imageHash = u.imageHash
-      WHERE u.imageUrl = ?
-    `);
-    getModerationByHashSql = db.prepare(`
-      SELECT
-        imageHash, verdict, labelsJson, moderationModelVersion,
-        contentTypesJson, checkedAt, lastUsedAt,
-        policyVersion, policyDecision, matchedRule, matchedLabel,
-        matchedConfidence, policyEvaluatedAt
-      FROM moderation_results
-      WHERE imageHash = ?
-    `);
-    putModerationUrlSql = db.prepare(`
-      INSERT INTO moderation_urls (imageUrl, imageHash, createdAt, lastUsedAt)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(imageUrl) DO UPDATE SET
-        imageHash = excluded.imageHash,
-        lastUsedAt = excluded.lastUsedAt
-    `);
-    putModerationResultSql = db.prepare(`
-      INSERT INTO moderation_results
-        (imageHash, verdict, labelsJson, moderationModelVersion,
-         contentTypesJson, checkedAt, lastUsedAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(imageHash) DO UPDATE SET
-        verdict = excluded.verdict,
-        labelsJson = excluded.labelsJson,
-        moderationModelVersion = excluded.moderationModelVersion,
-        contentTypesJson = excluded.contentTypesJson,
-        checkedAt = excluded.checkedAt,
-        lastUsedAt = excluded.lastUsedAt
-    `);
-    touchModerationUrlSql = db.prepare(
-      "UPDATE moderation_urls SET lastUsedAt = ? WHERE imageUrl = ?"
-    );
-    touchModerationResultSql = db.prepare(
-      "UPDATE moderation_results SET lastUsedAt = ? WHERE imageHash = ?"
-    );
-    countModerationResultsSql = db.prepare(
-      "SELECT COUNT(*) AS n FROM moderation_results"
-    );
-    updateModerationPolicySql = db.prepare(`
-      UPDATE moderation_results
-      SET policyVersion = ?,
-          policyDecision = ?,
-          matchedRule = ?,
-          matchedLabel = ?,
-          matchedConfidence = ?,
-          policyEvaluatedAt = ?,
-          lastUsedAt = ?
-      WHERE imageHash = ?
-    `);
-    selectModerationPolicyBackfillSql = db.prepare(`
-      SELECT imageHash, verdict, labelsJson
-      FROM moderation_results
-      WHERE policyVersion IS NULL OR policyVersion != ?
-      LIMIT ?
-    `);
-    countModerationPolicySql = db.prepare(`
-      SELECT policyDecision, COUNT(*) AS n
-      FROM moderation_results
-      WHERE policyVersion = ?
-      GROUP BY policyDecision
-    `);
-    moderationPolicyBackfillTransaction = db.transaction((rows, evaluatedAt) => {
-      for (const row of rows) {
-        const result = {
-          imageHash: row.imageHash,
-          verdict: row.verdict,
-          labels: parseJsonArray(row.labelsJson),
-        };
-        const policy = evaluateModerationPolicy(result);
-        updateModerationPolicySql.run(
-          policy.policyVersion,
-          policy.policyDecision,
-          policy.matchedRule,
-          policy.matchedLabel,
-          policy.matchedConfidence,
-          evaluatedAt,
-          evaluatedAt,
-          row.imageHash
-        );
-      }
-    });
 
     console.log(`[cache] disk cache at ${DB_PATH}`);
   } catch (error) {
@@ -1129,7 +838,6 @@ const latency = {
   largeCanvasDisk: new LatencyWindow(),
   largeCanvasGenerated: new LatencyWindow(),
   v2StreamWrite: new LatencyWindow(),
-  moderation: new LatencyWindow(),
 };
 
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
@@ -1214,25 +922,6 @@ const stats = {
   mangaDexSuggestiveFallbackRequests: 0,
   mangaDexSuggestiveFallbackMatches: 0,
 
-  moderationCalls: 0,
-  moderationSkippedPublicShadow: 0,
-  moderationCacheHits: 0,
-  moderationCacheMisses: 0,
-  moderationNoLabels: 0,
-  moderationLabelsDetected: 0,
-  moderationBlocked: 0,
-  moderationErrors: 0,
-  moderationThrottles: 0,
-  moderationRetries: 0,
-  moderationInflightDedupes: 0,
-  moderationPolicyEvaluations: 0,
-  moderationWouldAllow: 0,
-  moderationWouldBlock: 0,
-  moderationWouldUncertain: 0,
-  moderationEnforcedBlock: 0,
-  moderationEnforcedUncertain: 0,
-  moderationPolicyBackfilled: 0,
-  moderationPolicyBackfillFailures: 0,
 };
 
 // ---------- Peak memory, spike and garbage-collection telemetry ----------
@@ -1770,440 +1459,6 @@ async function readResponseBodyLimited(response, maxBytes, sizeCounter) {
 }
 
 
-// ---------- Rekognition moderation cache + bounded queue ----------
-const moderationInflight = new Map();
-let moderationRunning = 0;
-let moderationQueued = 0;
-const moderationWaiters = [];
-const moderationTouchTimes = new Map();
-const MODERATION_TOUCH_MIN_INTERVAL_MS = 10 * 60 * 1000;
-
-function moderationHealthSnapshot() {
-  const operational = Boolean(
-    AWS_REKOGNITION_ENABLED &&
-    moderationConfigured &&
-    (moderationLastErrorAt === 0 || moderationLastSuccessAt >= moderationLastErrorAt)
-  );
-
-  return {
-    enabled: AWS_REKOGNITION_ENABLED,
-    enforcing: AWS_REKOGNITION_ENFORCE,
-    publicShadowScanning: AWS_REKOGNITION_PUBLIC_SHADOW_SCAN,
-    configured: moderationConfigured,
-    operational,
-    policyVersion: MODERATION_POLICY_VERSION,
-  };
-}
-
-async function withModerationSlot(fn) {
-  if (moderationQueued >= AWS_REKOGNITION_MAX_QUEUE) {
-    const error = new Error("moderation queue full");
-    error.code = 503;
-    error.moderationUnavailable = true;
-    throw error;
-  }
-
-  moderationQueued++;
-  try {
-    if (moderationRunning >= AWS_REKOGNITION_MAX_CONCURRENCY) {
-      await new Promise((resolve) => moderationWaiters.push(resolve));
-    }
-
-    moderationRunning++;
-    try {
-      return await fn();
-    } finally {
-      moderationRunning--;
-      const next = moderationWaiters.shift();
-      if (next) next();
-    }
-  } finally {
-    moderationQueued--;
-  }
-}
-
-function parseJsonArray(value) {
-  try {
-    const parsed = JSON.parse(value || "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-// ---------- Roblox moderation policy ----------
-const MODERATION_POLICY_RULES = Object.freeze([
-  {
-    id: "explicit-sexual-activity",
-    label: "Explicit Sexual Activity",
-    blockAt: 70,
-    uncertainAt: 50,
-    priority: 100,
-  },
-  {
-    id: "exposed-male-genitalia",
-    label: "Exposed Male Genitalia",
-    blockAt: 70,
-    uncertainAt: 50,
-    priority: 99,
-  },
-  {
-    id: "exposed-female-genitalia",
-    label: "Exposed Female Genitalia",
-    blockAt: 70,
-    uncertainAt: 50,
-    priority: 99,
-  },
-  {
-    id: "exposed-female-nipple",
-    label: "Exposed Female Nipple",
-    blockAt: 70,
-    uncertainAt: 50,
-    priority: 98,
-  },
-  {
-    id: "exposed-buttocks-or-anus",
-    label: "Exposed Buttocks or Anus",
-    blockAt: 70,
-    uncertainAt: 50,
-    priority: 97,
-  },
-  {
-    // L2 fallback for the unlikely case where AWS returns Explicit Nudity
-    // without one of its more specific L3 child labels.
-    id: "explicit-nudity-fallback",
-    label: "Explicit Nudity",
-    blockAt: 90,
-    uncertainAt: 70,
-    priority: 90,
-  },
-  {
-    id: "partially-exposed-female-breast",
-    label: "Partially Exposed Female Breast",
-    blockAt: 80,
-    uncertainAt: 60,
-    priority: 80,
-  },
-  {
-    id: "partially-exposed-buttocks",
-    label: "Partially Exposed Buttocks",
-    blockAt: 80,
-    uncertainAt: 60,
-    priority: 75,
-  },
-  {
-    id: "implied-nudity",
-    label: "Implied Nudity",
-    blockAt: 80,
-    uncertainAt: 60,
-    priority: 70,
-  },
-  {
-    id: "obstructed-intimate-parts",
-    label: "Obstructed Intimate Parts",
-    blockAt: 80,
-    uncertainAt: 60,
-    priority: 70,
-  },
-]);
-
-function normalisePolicyLabelName(value) {
-  return String(value || "").trim().toLowerCase();
-}
-
-function choosePolicyMatch(matches) {
-  if (matches.length === 0) return null;
-  return matches.sort(
-    (a, b) =>
-      b.priority - a.priority ||
-      b.confidence - a.confidence ||
-      a.rule.localeCompare(b.rule)
-  )[0];
-}
-
-function evaluateModerationPolicy(result) {
-  const labels = Array.isArray(result?.labels) ? result.labels : [];
-  const labelsByName = new Map();
-
-  for (const label of labels) {
-    const name = normalisePolicyLabelName(label?.name);
-    if (!name) continue;
-    const confidence = Number(label?.confidence || 0);
-    const previous = labelsByName.get(name);
-    if (!previous || confidence > previous.confidence) {
-      labelsByName.set(name, {
-        name: String(label?.name || ""),
-        confidence,
-      });
-    }
-  }
-
-  const blockMatches = [];
-  const uncertainMatches = [];
-
-  for (const rule of MODERATION_POLICY_RULES) {
-    const detected = labelsByName.get(normalisePolicyLabelName(rule.label));
-    if (!detected) continue;
-
-    const match = {
-      rule: rule.id,
-      label: detected.name,
-      confidence: Number(detected.confidence.toFixed(2)),
-      priority: rule.priority,
-    };
-
-    if (detected.confidence >= rule.blockAt) {
-      blockMatches.push(match);
-    } else if (detected.confidence >= rule.uncertainAt) {
-      uncertainMatches.push(match);
-    }
-  }
-
-  const blockMatch = choosePolicyMatch(blockMatches);
-  if (blockMatch) {
-    return {
-      policyVersion: MODERATION_POLICY_VERSION,
-      policyDecision: "block",
-      matchedRule: blockMatch.rule,
-      matchedLabel: blockMatch.label,
-      matchedConfidence: blockMatch.confidence,
-    };
-  }
-
-  const uncertainMatch = choosePolicyMatch(uncertainMatches);
-  if (uncertainMatch) {
-    return {
-      policyVersion: MODERATION_POLICY_VERSION,
-      policyDecision: "uncertain",
-      matchedRule: uncertainMatch.rule,
-      matchedLabel: uncertainMatch.label,
-      matchedConfidence: uncertainMatch.confidence,
-    };
-  }
-
-  const strongestLabel = labels
-    .filter((label) => label?.name)
-    .sort((a, b) => Number(b?.confidence || 0) - Number(a?.confidence || 0))[0];
-
-  return {
-    policyVersion: MODERATION_POLICY_VERSION,
-    policyDecision: "allow",
-    matchedRule:
-      labels.length > 0 ? "no-sexual-safety-rule-matched" : "no-labels",
-    matchedLabel: strongestLabel ? String(strongestLabel.name) : null,
-    matchedConfidence: strongestLabel
-      ? Number(Number(strongestLabel.confidence || 0).toFixed(2))
-      : null,
-  };
-}
-
-function moderationPolicyChanged(result, policy) {
-  return (
-    result?.policyVersion !== policy.policyVersion ||
-    result?.policyDecision !== policy.policyDecision ||
-    result?.matchedRule !== policy.matchedRule ||
-    result?.matchedLabel !== policy.matchedLabel ||
-    Number(result?.matchedConfidence ?? -1) !==
-      Number(policy.matchedConfidence ?? -1)
-  );
-}
-
-function persistModerationPolicy(result, policy) {
-  if (
-    !db ||
-    !updateModerationPolicySql ||
-    !result?.imageHash ||
-    !moderationPolicyChanged(result, policy)
-  ) {
-    return;
-  }
-
-  const now = Date.now();
-  updateModerationPolicySql.run(
-    policy.policyVersion,
-    policy.policyDecision,
-    policy.matchedRule,
-    policy.matchedLabel,
-    policy.matchedConfidence,
-    now,
-    now,
-    result.imageHash
-  );
-
-  result.policyVersion = policy.policyVersion;
-  result.policyDecision = policy.policyDecision;
-  result.matchedRule = policy.matchedRule;
-  result.matchedLabel = policy.matchedLabel;
-  result.matchedConfidence = policy.matchedConfidence;
-  result.policyEvaluatedAt = now;
-}
-
-function recordModerationPolicyDecision(policy) {
-  stats.moderationPolicyEvaluations++;
-  if (policy.policyDecision === "block") stats.moderationWouldBlock++;
-  else if (policy.policyDecision === "uncertain") {
-    stats.moderationWouldUncertain++;
-  } else {
-    stats.moderationWouldAllow++;
-  }
-}
-
-function recordEnforcedModerationDecision(decision) {
-  stats.moderationBlocked++;
-  if (decision.policyDecision === "uncertain") {
-    stats.moderationEnforcedUncertain++;
-  } else {
-    stats.moderationEnforcedBlock++;
-  }
-}
-
-async function runModerationPolicyBackfill() {
-  if (
-    !db ||
-    !selectModerationPolicyBackfillSql ||
-    !moderationPolicyBackfillTransaction
-  ) {
-    return;
-  }
-
-  let updated = 0;
-  try {
-    while (true) {
-      const rows = selectModerationPolicyBackfillSql.all(
-        MODERATION_POLICY_VERSION,
-        MODERATION_POLICY_BACKFILL_BATCH
-      );
-      if (rows.length === 0) break;
-
-      moderationPolicyBackfillTransaction(rows, Date.now());
-      updated += rows.length;
-      stats.moderationPolicyBackfilled += rows.length;
-
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-
-    if (updated > 0) {
-      console.log(
-        `[moderation] policy ${MODERATION_POLICY_VERSION} ` +
-          `backfilled ${updated} cached image decisions without AWS calls`
-      );
-    }
-  } catch (error) {
-    stats.moderationPolicyBackfillFailures++;
-    console.warn("[moderation] policy backfill failed -", error.message);
-  }
-}
-// ---------- End Roblox moderation policy ----------
-
-function moderationRowToResult(row) {
-  if (!row) return null;
-  return {
-    imageHash: row.imageHash,
-    verdict: row.verdict,
-    labels: parseJsonArray(row.labelsJson),
-    moderationModelVersion: row.moderationModelVersion || null,
-    contentTypes: parseJsonArray(row.contentTypesJson),
-    checkedAt: Number(row.checkedAt || 0),
-    policyVersion: row.policyVersion || null,
-    policyDecision: row.policyDecision || null,
-    matchedRule: row.matchedRule || null,
-    matchedLabel: row.matchedLabel || null,
-    matchedConfidence:
-      row.matchedConfidence == null ? null : Number(row.matchedConfidence),
-    policyEvaluatedAt: Number(row.policyEvaluatedAt || 0),
-  };
-}
-
-function maybeTouchModerationCache(imageUrl, imageHash) {
-  if (!db) return;
-  const now = Date.now();
-  const key = imageUrl ? `url:${imageUrl}` : `hash:${imageHash}`;
-  const last = moderationTouchTimes.get(key) || 0;
-  if (now - last < MODERATION_TOUCH_MIN_INTERVAL_MS) return;
-
-  moderationTouchTimes.set(key, now);
-  try {
-    if (imageUrl) touchModerationUrlSql.run(now, imageUrl);
-    if (imageHash) touchModerationResultSql.run(now, imageHash);
-  } catch (error) {
-    console.warn("[moderation] cache touch failed -", error.message);
-  }
-}
-
-function loadModerationByUrl(imageUrl) {
-  if (!db || !getModerationByUrlSql) return null;
-  const row = getModerationByUrlSql.get(imageUrl);
-  if (!row) return null;
-  maybeTouchModerationCache(imageUrl, row.imageHash);
-  return moderationRowToResult(row);
-}
-
-function loadModerationByHash(imageHash) {
-  if (!db || !getModerationByHashSql) return null;
-  const row = getModerationByHashSql.get(imageHash);
-  if (!row) return null;
-  maybeTouchModerationCache(null, imageHash);
-  return moderationRowToResult(row);
-}
-
-function saveModerationUrl(imageUrl, imageHash) {
-  if (!db || !putModerationUrlSql) return;
-  const now = Date.now();
-  putModerationUrlSql.run(imageUrl, imageHash, now, now);
-}
-
-function saveModerationResult(result) {
-  if (!db || !putModerationResultSql) return;
-  const now = Date.now();
-  putModerationResultSql.run(
-    result.imageHash,
-    result.verdict,
-    JSON.stringify(result.labels || []),
-    result.moderationModelVersion || null,
-    JSON.stringify(result.contentTypes || []),
-    now,
-    now
-  );
-}
-
-function normaliseModerationLabels(labels) {
-  return (Array.isArray(labels) ? labels : [])
-    .map((label) => ({
-      name: String(label?.Name || ""),
-      parentName: String(label?.ParentName || ""),
-      confidence: Number(Number(label?.Confidence || 0).toFixed(2)),
-      taxonomyLevel: Number(label?.TaxonomyLevel || 0),
-    }))
-    .filter((label) => label.name)
-    .sort((a, b) => b.confidence - a.confidence || a.name.localeCompare(b.name));
-}
-
-function normaliseContentTypes(contentTypes) {
-  return (Array.isArray(contentTypes) ? contentTypes : [])
-    .map((entry) => ({
-      name: String(entry?.Name || ""),
-      confidence: Number(Number(entry?.Confidence || 0).toFixed(2)),
-    }))
-    .filter((entry) => entry.name)
-    .sort((a, b) => b.confidence - a.confidence || a.name.localeCompare(b.name));
-}
-
-function isTransientRekognitionError(error) {
-  const name = String(error?.name || error?.Code || error?.code || "");
-  const status = Number(error?.$metadata?.httpStatusCode || 0);
-  return (
-    status === 429 ||
-    status >= 500 ||
-    /Throttl|ProvisionedThroughput|ServiceUnavailable|InternalServer|Timeout|Networking|Abort/i.test(name)
-  );
-}
-
-function isThrottlingError(error) {
-  const name = String(error?.name || error?.Code || error?.code || "");
-  const status = Number(error?.$metadata?.httpStatusCode || 0);
-  return status === 429 || /Throttl|ProvisionedThroughput/i.test(name);
-}
-
 async function downloadAllowedImage(imageUrl) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -2243,272 +1498,6 @@ async function downloadAllowedImage(imageUrl) {
     clearTimeout(timeout);
     endOperation("imageDownloads");
   }
-}
-
-async function createModerationJpeg(imageBuffer) {
-  let maxDim = AWS_REKOGNITION_MAX_DIM;
-  let quality = AWS_REKOGNITION_JPEG_QUALITY;
-  let output = null;
-
-  beginOperation("moderationSharpJobs");
-  try {
-    for (let attempt = 0; attempt < 4; attempt++) {
-      output = await sharp(imageBuffer, {
-        limitInputPixels: MAX_INPUT_PIXELS,
-        limitInputChannels: 4,
-        sequentialRead: true,
-        pages: 1,
-      })
-        .rotate()
-        .resize({
-          width: maxDim,
-          height: maxDim,
-          fit: "inside",
-          withoutEnlargement: true,
-        })
-        .flatten({ background: { r: 255, g: 255, b: 255 } })
-        .removeAlpha()
-        .jpeg({ quality, chromaSubsampling: "4:2:0", mozjpeg: false })
-        .toBuffer();
-
-      if (output.length <= AWS_REKOGNITION_MAX_IMAGE_BYTES) return output;
-      maxDim = Math.max(512, Math.floor(maxDim * 0.75));
-      quality = Math.max(50, quality - 10);
-    }
-  } finally {
-    endOperation("moderationSharpJobs");
-  }
-
-  const error = new Error("Unable to prepare image within moderation size limit");
-  error.code = 400;
-  throw error;
-}
-
-async function sendRekognitionRequest(jpegBuffer) {
-  if (!moderationConfigured || !rekognitionClient) {
-    const error = new Error("image moderation is not configured");
-    error.code = 503;
-    error.moderationUnavailable = true;
-    throw error;
-  }
-
-  let lastError;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      AWS_REKOGNITION_TIMEOUT_MS
-    );
-    const started = performance.now();
-
-    stats.moderationCalls++;
-    beginOperation("rekognitionRequests");
-    try {
-      const command = new rekognitionSdk.DetectModerationLabelsCommand({
-        Image: { Bytes: jpegBuffer },
-        MinConfidence: AWS_REKOGNITION_MIN_CONFIDENCE,
-      });
-      const response = await rekognitionClient.send(command, {
-        abortSignal: controller.signal,
-      });
-      moderationLastSuccessAt = Date.now();
-      moderationLastErrorCode = null;
-      latency.moderation.record(performance.now() - started);
-      return response;
-    } catch (error) {
-      lastError = error;
-      moderationLastErrorAt = Date.now();
-      moderationLastErrorCode = String(error?.name || error?.code || "error");
-      latency.moderation.record(performance.now() - started);
-      if (isThrottlingError(error)) stats.moderationThrottles++;
-
-      if (attempt === 0 && isTransientRekognitionError(error)) {
-        stats.moderationRetries++;
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        continue;
-      }
-      throw error;
-    } finally {
-      clearTimeout(timeout);
-      endOperation("rekognitionRequests");
-    }
-  }
-
-  throw lastError;
-}
-
-function moderationDecision(result, imageBuffer = null, source = "cache") {
-  const hasLabels = result.verdict === "labels_detected";
-  const policy = evaluateModerationPolicy(result);
-  persistModerationPolicy(result, policy);
-  recordModerationPolicyDecision(policy);
-
-  return {
-    ...result,
-    ...policy,
-    hasLabels,
-    // This field represents the policy verdict itself. Shadow-mode callers are
-    // permitted separately by applyModerationEnforcement().
-    allowed: policy.policyDecision === "allow",
-    imageBuffer,
-    source,
-  };
-}
-
-function moderationBlockedError(decision) {
-  const uncertain = decision?.policyDecision === "uncertain";
-  const error = new Error(
-    uncertain
-      ? "image unavailable pending moderation review"
-      : "image blocked by moderation policy"
-  );
-  error.code = 403;
-  error.moderationBlocked = true;
-  error.policyDecision = decision?.policyDecision || "block";
-  error.matchedRule = decision?.matchedRule || null;
-  return error;
-}
-
-function moderationUnavailableError(error) {
-  const wrapped = new Error("image moderation temporarily unavailable");
-  wrapped.code = 503;
-  wrapped.moderationUnavailable = true;
-  wrapped.cause = error;
-  return wrapped;
-}
-
-function applyModerationEnforcement(decision, effectiveEnforcement) {
-  if (!effectiveEnforcement) {
-    return { ...decision, allowed: true };
-  }
-
-  if (decision?.moderationUnavailable) {
-    throw moderationUnavailableError(decision.moderationErrorCause);
-  }
-
-  if (decision?.policyDecision !== "allow") {
-    recordEnforcedModerationDecision(decision);
-    throw moderationBlockedError(decision);
-  }
-
-  return { ...decision, allowed: true };
-}
-
-async function ensureImageModerated(
-  imageUrl,
-  effectiveEnforcement = AWS_REKOGNITION_ENFORCE
-) {
-  if (!AWS_REKOGNITION_ENABLED) {
-    return {
-      verdict: "disabled",
-      allowed: true,
-      imageBuffer: null,
-      source: "disabled",
-    };
-  }
-
-  if (!moderationConfigured) {
-    stats.moderationErrors++;
-    if (effectiveEnforcement) throw moderationUnavailableError();
-    return {
-      verdict: "error",
-      allowed: true,
-      imageBuffer: null,
-      source: "unconfigured",
-      moderationUnavailable: true,
-    };
-  }
-
-  const directHit = loadModerationByUrl(imageUrl);
-  if (directHit) {
-    stats.moderationCacheHits++;
-    if (directHit.verdict === "no_labels") stats.moderationNoLabels++;
-    else stats.moderationLabelsDetected++;
-
-    return applyModerationEnforcement(
-      moderationDecision(directHit, null, "url-cache"),
-      effectiveEnforcement
-    );
-  }
-
-  let promise = moderationInflight.get(imageUrl);
-  if (promise) {
-    stats.moderationInflightDedupes++;
-  } else {
-    stats.moderationCacheMisses++;
-    let imageBuffer = null;
-
-    // The shared in-flight promise computes the real moderation decision only.
-    // Each waiting request applies its own enforcement mode afterwards, so a
-    // Studio-enforced request can safely share work with a live shadow request.
-    promise = withModerationSlot(async () => {
-      // Recheck after waiting for the queue.
-      const lateHit = loadModerationByUrl(imageUrl);
-      if (lateHit) {
-        stats.moderationCacheHits++;
-        return moderationDecision(lateHit, null, "url-cache");
-      }
-
-      beginOperation("moderationDownloads");
-      try {
-        imageBuffer = await downloadAllowedImage(imageUrl);
-      } finally {
-        endOperation("moderationDownloads");
-      }
-
-      const imageHash = crypto
-        .createHash("sha256")
-        .update(imageBuffer)
-        .digest("hex");
-      saveModerationUrl(imageUrl, imageHash);
-
-      const hashHit = loadModerationByHash(imageHash);
-      if (hashHit) {
-        stats.moderationCacheHits++;
-        return moderationDecision(hashHit, imageBuffer, "hash-cache");
-      }
-
-      const moderationJpeg = await createModerationJpeg(imageBuffer);
-      const response = await sendRekognitionRequest(moderationJpeg);
-      const labels = normaliseModerationLabels(response?.ModerationLabels);
-      const contentTypes = normaliseContentTypes(response?.ContentTypes);
-      const result = {
-        imageHash,
-        verdict: labels.length > 0 ? "labels_detected" : "no_labels",
-        labels,
-        moderationModelVersion: response?.ModerationModelVersion || null,
-        contentTypes,
-        checkedAt: Date.now(),
-      };
-      saveModerationResult(result);
-
-      if (result.verdict === "no_labels") stats.moderationNoLabels++;
-      else stats.moderationLabelsDetected++;
-
-      return moderationDecision(result, imageBuffer, "aws");
-    })
-      .catch((error) => {
-        stats.moderationErrors++;
-        console.warn(
-          "[moderation] check failed -",
-          String(error?.name || error?.code || error?.message || "error")
-        );
-        return {
-          verdict: "error",
-          allowed: true,
-          imageBuffer,
-          source: "error-shadow",
-          moderationUnavailable: true,
-          moderationErrorCause: error,
-        };
-      })
-      .finally(() => moderationInflight.delete(imageUrl));
-
-    moderationInflight.set(imageUrl, promise);
-  }
-
-  const decision = await promise;
-  return applyModerationEnforcement(decision, effectiveEnforcement);
 }
 
 function normaliseSearchText(value) {
@@ -3329,7 +2318,6 @@ app.get("/", (req, res) => {
       mangaDexEnabled: ENABLE_MANGADEX,
       endpoint: "/catalog/manga-covers",
     },
-    moderation: moderationHealthSnapshot(),
   });
 });
 
@@ -3338,28 +2326,11 @@ app.get("/health", (req, res) => {
     ok: true,
     format2Available: hasZstd(),
     mangaDexEnabled: ENABLE_MANGADEX,
-    moderation: moderationHealthSnapshot(),
   });
 });
 
 app.get("/stats", (req, res) => {
   const diskRow = db ? countSql.get() : { n: 0 };
-  const moderationRow = db && countModerationResultsSql
-    ? countModerationResultsSql.get()
-    : { n: 0 };
-  const policyDecisionRows = db && countModerationPolicySql
-    ? countModerationPolicySql.all(MODERATION_POLICY_VERSION)
-    : [];
-  const policyCachedDecisions = {
-    allow: 0,
-    block: 0,
-    uncertain: 0,
-  };
-  for (const row of policyDecisionRows) {
-    if (row.policyDecision in policyCachedDecisions) {
-      policyCachedDecisions[row.policyDecision] = Number(row.n || 0);
-    }
-  }
   const compressionRatio =
     stats.v2CompressedBytesSent > 0
       ? Number(
@@ -3415,25 +2386,6 @@ app.get("/stats", (req, res) => {
       concurrency: sharp.concurrency(),
       counters: sharp.counters(),
       maxInputPixels: MAX_INPUT_PIXELS,
-    },
-    moderation: {
-      ...moderationHealthSnapshot(),
-      region: AWS_REGION,
-      minConfidence: AWS_REKOGNITION_MIN_CONFIDENCE,
-      maxConcurrency: AWS_REKOGNITION_MAX_CONCURRENCY,
-      maxQueue: AWS_REKOGNITION_MAX_QUEUE,
-      running: moderationRunning,
-      queued: moderationQueued,
-      inflight: moderationInflight.size,
-      cachedImages: Number(moderationRow.n || 0),
-      policyCachedDecisions,
-      lastSuccessAt: moderationLastSuccessAt
-        ? new Date(moderationLastSuccessAt).toISOString()
-        : null,
-      lastErrorAt: moderationLastErrorAt
-        ? new Date(moderationLastErrorAt).toISOString()
-        : null,
-      lastErrorCode: moderationLastErrorCode,
     },
     catalog: {
       mangaDexEnabled: ENABLE_MANGADEX,
@@ -3702,31 +2654,6 @@ app.post("/pixelize", async (req, res) => {
     const memCache = selectedMem.cache;
     const cacheTtl = isCanvas ? TTL_CANVAS_MS : TTL_PREVIEW_MS;
 
-    // Moderation is intentionally checked before every pixel cache layer.
-    // This prevents artwork cached before moderation was introduced from
-    // bypassing enforcement. A first-time check returns the downloaded source
-    // buffer so the generation path can reuse it without a second download.
-    // The effective mode is request-scoped: global enforcement applies to all
-    // callers, while a valid secret header can enforce only a Studio request.
-    const effectiveModerationEnforcement =
-      effectiveModerationEnforcementForRequest(req);
-    const moderationRequired = shouldModerateRequest(req);
-    let moderationResult;
-    if (moderationRequired) {
-      moderationResult = await ensureImageModerated(
-        imageUrl,
-        effectiveModerationEnforcement
-      );
-    } else {
-      stats.moderationSkippedPublicShadow++;
-      moderationResult = {
-        verdict: "skipped",
-        allowed: true,
-        imageBuffer: null,
-        source: "public-shadow-disabled",
-      };
-    }
-    let moderatedImageBuffer = moderationResult.imageBuffer || null;
 
     // 1) Memory cache.
     const memHit = memCache.get(key);
@@ -3774,11 +2701,7 @@ app.post("/pixelize", async (req, res) => {
         const generationOperation = `${selectedMem.kind}Generations`;
         beginOperation(generationOperation);
         try {
-          let imageBuffer = moderatedImageBuffer;
-          moderatedImageBuffer = null;
-          if (!imageBuffer) {
-            imageBuffer = await downloadAllowedImage(imageUrl);
-          }
+          let imageBuffer = await downloadAllowedImage(imageUrl);
 
           let raw;
           beginOperation("sharpJobs");
@@ -3878,14 +2801,6 @@ app.post("/pixelize", async (req, res) => {
       return;
     }
 
-    if (error && error.code === 403 && error.moderationBlocked) {
-      return res.status(403).json({
-        error:
-          error.policyDecision === "uncertain"
-            ? "image unavailable pending moderation review"
-            : "image blocked by moderation policy",
-      });
-    }
 
     if (error && error.code === 503) {
       if (error.compressionUnavailable) stats.formatV2Unavailable++;
@@ -3966,29 +2881,12 @@ async function startServer() {
         `catalogCache=${CATALOG_CACHE_MAX_ITEMS} items/${Math.round(CATALOG_CACHE_MAX_BYTES / 1024 / 1024)}MB`
     );
     console.log(
-      `  Rekognition enabled=${AWS_REKOGNITION_ENABLED} ` +
-        `enforcing=${AWS_REKOGNITION_ENFORCE} ` +
-        `publicShadowScan=${AWS_REKOGNITION_PUBLIC_SHADOW_SCAN} ` +
-        `configured=${moderationConfigured} ` +
-        `region=${AWS_REGION} concurrency=${AWS_REKOGNITION_MAX_CONCURRENCY} ` +
-        `policy=${MODERATION_POLICY_VERSION}`
-    );
-    console.log(
       `  memoryTelemetry rss=${MEMORY_RSS_SAMPLE_MS}ms ` +
         `full=${MEMORY_FULL_SAMPLE_MS}ms ` +
         `spikeHeap=${MEMORY_HEAP_SPIKE_MB}MB ` +
         `spikeRss=${MEMORY_RSS_SPIKE_MB}MB`
     );
 
-    setImmediate(() => {
-      runModerationPolicyBackfill().catch((error) => {
-        stats.moderationPolicyBackfillFailures++;
-        console.warn(
-          "[moderation] policy backfill startup failure -",
-          error.message
-        );
-      });
-    });
   });
 }
 
@@ -4006,9 +2904,6 @@ function shutdown(signal) {
   const finish = () => {
     try {
       flushDiskTouches();
-      if (rekognitionClient && typeof rekognitionClient.destroy === "function") {
-        rekognitionClient.destroy();
-      }
       if (db && db.open) db.close();
     } catch (error) {
       console.warn("[shutdown] cache close failed -", error.message);
