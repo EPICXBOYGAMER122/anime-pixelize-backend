@@ -8,7 +8,6 @@
     "check": "node --check pixelize-server.js"
   },
   "dependencies": {
-    "@aws-sdk/client-rekognition": "^3.1090.0",
     "@bokuweb/zstd-wasm": "^0.0.27",
     "better-sqlite3": "^11.8.1",
     "express": "^4.22.2",
