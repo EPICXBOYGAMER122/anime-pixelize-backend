@@ -251,7 +251,12 @@ const GZIP_LEVEL = Math.max(1, Math.min(9, Number(process.env.GZIP_LEVEL || 6)))
 const TTL_PREVIEW_MS = Number(process.env.TTL_PREVIEW_MS || 30 * 60 * 1000);
 const TTL_CANVAS_MS = Number(process.env.TTL_CANVAS_MS || 2 * 60 * 60 * 1000);
 
-// Disk cache prune sweep interval + max age.
+// Disk cache maintenance:
+// - previews expire after 7 days without a request
+// - canvases expire after 14 days without a request
+// - if the logical compressed pixel cache exceeds 12 GiB, trim oldest-used
+//   entries back toward 10 GiB. SQLite can reuse freed pages; no VACUUM is
+//   performed in the live service.
 const DISK_PRUNE_INTERVAL_MS = Number(
   process.env.DISK_PRUNE_INTERVAL_MS || 6 * 60 * 60 * 1000
 );
@@ -259,7 +264,23 @@ const DISK_PREVIEW_MAX_AGE_MS = Number(
   process.env.DISK_PREVIEW_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000
 );
 const DISK_CANVAS_MAX_AGE_MS = Number(
-  process.env.DISK_CANVAS_MAX_AGE_MS || 60 * 24 * 60 * 60 * 1000
+  process.env.DISK_CANVAS_MAX_AGE_MS || 14 * 24 * 60 * 60 * 1000
+);
+const GIB = 1024 * 1024 * 1024;
+const DISK_CACHE_HIGH_WATER_BYTES = Math.max(
+  0,
+  Number(process.env.DISK_CACHE_HIGH_WATER_BYTES ?? 12 * GIB)
+);
+const DISK_CACHE_TARGET_BYTES = Math.max(
+  0,
+  Math.min(
+    DISK_CACHE_HIGH_WATER_BYTES,
+    Number(process.env.DISK_CACHE_TARGET_BYTES ?? 10 * GIB)
+  )
+);
+const DISK_CACHE_LRU_BATCH_ROWS = Math.max(
+  100,
+  Math.floor(Number(process.env.DISK_CACHE_LRU_BATCH_ROWS ?? 500))
 );
 
 const ALLOWED_HOSTS = new Set([
@@ -327,6 +348,10 @@ let putSql;
 let touchSql;
 let countSql;
 let pruneSql;
+let diskLogicalBytesSql;
+let oldestDiskRowsSql;
+let deleteDiskRowSql;
+let deleteDiskRowsTransaction;
 let updateZstdSql;
 let flushTouchesTransaction;
 
@@ -392,6 +417,26 @@ if (sqlite) {
       WHERE (mode = 'preview' AND lastUsedAt < ?)
          OR (mode != 'preview' AND lastUsedAt < ?)
     `);
+    diskLogicalBytesSql = db.prepare(`
+      SELECT COALESCE(
+        SUM(length(pixelsGz) + COALESCE(length(pixelsZstd), 0)),
+        0
+      ) AS bytes
+      FROM cache
+    `);
+    oldestDiskRowsSql = db.prepare(`
+      SELECT
+        key,
+        lastUsedAt,
+        length(pixelsGz) + COALESCE(length(pixelsZstd), 0) AS bytes
+      FROM cache
+      ORDER BY lastUsedAt ASC
+      LIMIT ?
+    `);
+    deleteDiskRowSql = db.prepare("DELETE FROM cache WHERE key = ?");
+    deleteDiskRowsTransaction = db.transaction((keys) => {
+      for (const key of keys) deleteDiskRowSql.run(key);
+    });
 
 
     console.log(`[cache] disk cache at ${DB_PATH}`);
@@ -2658,6 +2703,10 @@ app.post("/pixelize", async (req, res) => {
     // 1) Memory cache.
     const memHit = memCache.get(key);
     if (memHit) {
+      // A memory hit is still real usage of the persistent cache entry.
+      // Queue a batched disk touch so popular covers stay protected from
+      // age-based and LRU disk eviction without adding a synchronous write.
+      queueDiskTouch(key);
       stats.memCacheHits++;
       if (selectedMem.kind === "preview") stats.previewMemCacheHits++;
       else if (selectedMem.kind === "canvas") stats.canvasMemCacheHits++;
@@ -2690,7 +2739,10 @@ app.post("/pixelize", async (req, res) => {
     const resolved = await dedupe(key, () =>
       withSlot(async () => {
         const lateMem = memCache.get(key);
-        if (lateMem) return { entry: lateMem, source: "memory" };
+        if (lateMem) {
+          queueDiskTouch(key);
+          return { entry: lateMem, source: "memory" };
+        }
 
         const lateDisk = loadDiskEntry(key, formatVersion);
         if (lateDisk) {
@@ -2825,22 +2877,104 @@ app.post("/pixelize", async (req, res) => {
   }
 });
 
-// ---------- Periodic disk prune ----------
-if (db) {
-  setInterval(() => {
-    const now = Date.now();
-    try {
-      const info = pruneSql.run(
-        now - DISK_PREVIEW_MAX_AGE_MS,
-        now - DISK_CANVAS_MAX_AGE_MS
-      );
-      if (info.changes > 0) {
-        console.log(`[cache] pruned ${info.changes} stale disk entries`);
+// ---------- Disk cache maintenance ----------
+let diskMaintenanceRunning = false;
+
+function formatGiB(bytes) {
+  return (Number(bytes || 0) / GIB).toFixed(2);
+}
+
+async function runDiskCacheMaintenance(reason = "periodic") {
+  if (!db || diskMaintenanceRunning) return;
+  diskMaintenanceRunning = true;
+
+  const now = Date.now();
+  let agePrunedRows = 0;
+  let lruPrunedRows = 0;
+  let lruPrunedBytes = 0;
+
+  try {
+    // Persist queued usage timestamps before deciding what is stale. This keeps
+    // recently requested entries from being removed by the maintenance pass.
+    flushDiskTouches();
+
+    const ageInfo = pruneSql.run(
+      now - DISK_PREVIEW_MAX_AGE_MS,
+      now - DISK_CANVAS_MAX_AGE_MS
+    );
+    agePrunedRows = Number(ageInfo.changes || 0);
+
+    let logicalBytes = Number(diskLogicalBytesSql.get()?.bytes || 0);
+    const logicalBytesBeforeLru = logicalBytes;
+
+    if (
+      DISK_CACHE_HIGH_WATER_BYTES > 0 &&
+      logicalBytes > DISK_CACHE_HIGH_WATER_BYTES
+    ) {
+      while (logicalBytes > DISK_CACHE_TARGET_BYTES) {
+        // Requests can arrive between batches. Flush their touches before
+        // selecting the next oldest rows so active covers remain protected.
+        flushDiskTouches();
+
+        const rows = oldestDiskRowsSql.all(DISK_CACHE_LRU_BATCH_ROWS);
+        if (rows.length === 0) break;
+
+        const keys = [];
+        let batchBytes = 0;
+        for (const row of rows) {
+          keys.push(row.key);
+          batchBytes += Number(row.bytes || 0);
+          if (logicalBytes - batchBytes <= DISK_CACHE_TARGET_BYTES) break;
+        }
+
+        if (keys.length === 0) break;
+        deleteDiskRowsTransaction(keys);
+
+        for (const key of keys) {
+          pendingDiskTouches.delete(key);
+          lastPersistedDiskTouch.delete(key);
+        }
+
+        lruPrunedRows += keys.length;
+        lruPrunedBytes += batchBytes;
+        logicalBytes = Math.max(0, logicalBytes - batchBytes);
+
+        // Yield between batches so a large cleanup does not monopolise the
+        // Node event loop while the live game is serving requests.
+        await new Promise((resolve) => setImmediate(resolve));
       }
-      db.pragma("optimize");
-    } catch (error) {
-      console.warn("[cache] prune failed", error.message);
+
+      console.log(
+        `[cache] LRU trim ${reason}: ${formatGiB(logicalBytesBeforeLru)} GiB -> ` +
+          `${formatGiB(logicalBytes)} GiB, removed ${lruPrunedRows} rows ` +
+          `(${formatGiB(lruPrunedBytes)} GiB logical)`
+      );
     }
+
+    if (agePrunedRows > 0) {
+      console.log(
+        `[cache] age prune ${reason}: removed ${agePrunedRows} stale rows ` +
+          `(preview>${Math.round(DISK_PREVIEW_MAX_AGE_MS / 86_400_000)}d, ` +
+          `canvas>${Math.round(DISK_CANVAS_MAX_AGE_MS / 86_400_000)}d unused)`
+      );
+    }
+
+    db.pragma("optimize");
+  } catch (error) {
+    console.warn("[cache] maintenance failed", error.message);
+  } finally {
+    diskMaintenanceRunning = false;
+  }
+}
+
+if (db) {
+  // Give startup traffic a short quiet window, then enforce the policy once.
+  setTimeout(() => {
+    void runDiskCacheMaintenance("startup");
+  }, 60_000).unref();
+
+  setInterval(() => {
+    void runDiskCacheMaintenance("periodic");
   }, DISK_PRUNE_INTERVAL_MS).unref();
 }
 
@@ -2860,6 +2994,12 @@ async function startServer() {
         `large=${MAX_LARGE_CANVAS_CACHE_ITEMS} ` +
         `(large >= ${LARGE_CANVAS_MIN_PIXELS} px) ` +
         `diskCache=${db ? "on" : "off"}`
+    );
+    console.log(
+      `  diskPolicy preview=${Math.round(DISK_PREVIEW_MAX_AGE_MS / 86_400_000)}d ` +
+        `canvas=${Math.round(DISK_CANVAS_MAX_AGE_MS / 86_400_000)}d ` +
+        `highWater=${formatGiB(DISK_CACHE_HIGH_WATER_BYTES)}GiB ` +
+        `target=${formatGiB(DISK_CACHE_TARGET_BYTES)}GiB`
     );
     console.log(
       `  compressed format v2=${hasZstd() ? "available" : "unavailable"} ` +
